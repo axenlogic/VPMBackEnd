@@ -63,6 +63,12 @@ def decode_jwt_token(token: str) -> dict:
 
 def send_email(to_email: str, subject: str, body: str):
     """Send an email using SMTP"""
+    # Check if SMTP is configured
+    if not settings.SMTP_EMAIL or not settings.SMTP_PASSWORD:
+        error_msg = "SMTP not configured. Please set SMTP_EMAIL and SMTP_PASSWORD in .env file"
+        print(f"Failed to send email: {error_msg}")
+        raise ValueError(error_msg)
+    
     try:
         msg = MIMEMultipart()
         msg['From'] = settings.SMTP_EMAIL
@@ -76,11 +82,9 @@ def send_email(to_email: str, subject: str, body: str):
             server.login(settings.SMTP_EMAIL, settings.SMTP_PASSWORD)
             server.send_message(msg)
     except Exception as e:
-        print(f"Failed to send email: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to send email"
-        )
+        error_msg = f"Failed to send email: {str(e)}"
+        print(error_msg)
+        raise ValueError(error_msg)
 
 def send_otp_email(email: str, otp: str):
     """Send OTP verification email"""

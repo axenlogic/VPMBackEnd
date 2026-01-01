@@ -5,7 +5,7 @@ from app.db.database import get_db
 from app.auth.models import User, OTPVerification, PasswordResetToken
 from app.auth.schemas import (
     SignupRequest, VerifyOTPRequest, LoginRequest, 
-    ForgotPasswordRequest, ResetPasswordRequest,
+    ForgotPasswordRequest, ResetPasswordRequest, ResendOTPRequest,
     TokenResponse, MessageResponse, SignupResponse, UserProfile, UpdateProfileRequest
 )
 from app.auth.utils import (
@@ -23,7 +23,47 @@ def signup(request: SignupRequest, db: Session = Depends(get_db)):
     # Check if user already exists
     existing_user = db.query(User).filter(User.email == request.email).first()
     if existing_user:
-        return {"message": "Email already registered", "username": request.email, "full_name": existing_user.full_name}
+        # If user exists but is not verified, resend OTP
+        if not existing_user.is_verified:
+            # Generate and store new OTP
+            otp = generate_otp()
+            expiry = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRY_MINUTES)
+            
+            # Delete any existing OTPs for this email
+            db.query(OTPVerification).filter(OTPVerification.email == request.email).delete()
+            
+            otp_record = OTPVerification(
+                email=request.email,
+                otp=otp,
+                expires_at=expiry
+            )
+            db.add(otp_record)
+            db.commit()
+            
+            # Send OTP email (gracefully handle failures)
+            try:
+                send_otp_email(request.email, otp)
+            except Exception as e:
+                # Log the error but don't fail the request
+                print(f"Failed to send OTP email: {e}")
+            
+            # In development mode, return the OTP for testing
+            if settings.DEBUG:
+                return {
+                    "message": "OTP resent to your email for verification", 
+                    "username": request.email, 
+                    "full_name": existing_user.full_name,
+                    "otp": otp
+                }
+            
+            return {
+                "message": "OTP resent to your email for verification", 
+                "username": request.email, 
+                "full_name": existing_user.full_name
+            }
+        else:
+            # User is already verified
+            return {"message": "Email already registered", "username": request.email, "full_name": existing_user.full_name}
     
     # Create new user
     hashed_pwd = hash_password(request.password)
@@ -135,6 +175,56 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         if settings.DEBUG:
             return {"message": f"Internal server error: {str(e)}"}
         return {"message": "Internal server error. Please try again later."}
+
+@router.post("/resend-otp", response_model=SignupResponse)
+def resend_otp(request: ResendOTPRequest, db: Session = Depends(get_db)):
+    """Resend OTP to user's email"""
+    
+    # Check if user exists
+    user = db.query(User).filter(User.email == request.email).first()
+    if not user:
+        return {"message": "Email not registered", "username": request.email, "full_name": ""}
+    
+    # Check if user is already verified
+    if user.is_verified:
+        return {"message": "Email already verified", "username": request.email, "full_name": user.full_name}
+    
+    # Generate and store new OTP
+    otp = generate_otp()
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRY_MINUTES)
+    
+    # Delete any existing OTPs for this email
+    db.query(OTPVerification).filter(OTPVerification.email == request.email).delete()
+    
+    otp_record = OTPVerification(
+        email=request.email,
+        otp=otp,
+        expires_at=expiry
+    )
+    db.add(otp_record)
+    db.commit()
+    
+    # Send OTP email (gracefully handle failures)
+    try:
+        send_otp_email(request.email, otp)
+    except Exception as e:
+        # Log the error but don't fail the request
+        print(f"Failed to send OTP email: {e}")
+    
+    # In development mode, return the OTP for testing
+    if settings.DEBUG:
+        return {
+            "message": "OTP resent to your email for verification", 
+            "username": request.email, 
+            "full_name": user.full_name,
+            "otp": otp
+        }
+    
+    return {
+        "message": "OTP resent to your email for verification", 
+        "username": request.email, 
+        "full_name": user.full_name
+    }
 
 @router.post("/forgot-password", response_model=MessageResponse)
 def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):

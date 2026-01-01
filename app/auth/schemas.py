@@ -24,6 +24,9 @@ class LoginRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
+class ResendOTPRequest(BaseModel):
+    email: EmailStr
+
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str = Field(..., min_length=8)
@@ -51,6 +54,7 @@ class SignupResponse(BaseModel):
     message: str
     username: str  # email address
     full_name: str
+    otp: str = Field(None, description="OTP code (only in DEBUG mode)")  # Optional OTP for debug mode
 
 class UserProfile(BaseModel):
     id: int
