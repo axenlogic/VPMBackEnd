@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: vpm_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-app_db}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASS:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vpm_network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpm_backend
+    environment:
+      # Database connection
+      ENVIRONMENT: local
+      DB_NAME: ${DB_NAME:-app_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASS: ${DB_PASS:-postgres}
+      DB_HOST: postgres
+      DB_PORT: 5432
+
+      # JWT
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-your-super-secret-jwt-key-here-change-in-production}
+
+      # SMTP
+      SMTP_SERVER: ${SMTP_SERVER:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_EMAIL: ${SMTP_EMAIL:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+
+      # Encryption (for PHI)
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+
+      # Frontend URLs
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+      FRONTEND_URL_8081: ${FRONTEND_URL_8081:-http://localhost:8000}
+
+      # Debug
+      DEBUG: ${DEBUG:-True}
+
+      # Port (use 8000 for local dev, matches run_local.sh)
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./logs:/app/logs
+    networks:
+      - vpm_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  vpm_network:
+    driver: bridge
