@@ -1,14 +1,37 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from app.db.database import Base, engine
 from app.auth import routes as auth_routes
 
 app = FastAPI(
-    title="MedicalCare Backend API",
-    description="Auth, OTP verification, password reset, etc.",
+    title="VPM Backend API",
+    description="SAP Data Dashboard - Auth, Intake Forms, OTP verification, password reset, etc.",
     version="1.0.0",
 )
+
+# Rate limiting setup (optional - install slowapi for rate limiting)
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    
+    # Initialize rate limiter
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    RATE_LIMITING_ENABLED = True
+except ImportError:
+    print("WARNING: slowapi not installed. Rate limiting disabled. Install with: pip install slowapi httpx pillow")
+    RATE_LIMITING_ENABLED = False
+    # Create a dummy limiter object
+    class DummyLimiter:
+        def limit(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+    app.state.limiter = DummyLimiter()
 
 # CORS to allow external frontend(s)
 # Support multiple frontend URLs from environment
@@ -32,6 +55,10 @@ app.add_middleware(
 
 # Include auth routes under /auth
 app.include_router(auth_routes.router, prefix="/auth", tags=["Auth"])
+
+# Include SAP intake routes (public endpoints)
+from app.sap import routes as sap_routes
+app.include_router(sap_routes.router, tags=["Intake"])
 
 @app.get("/health")
 def health_check():

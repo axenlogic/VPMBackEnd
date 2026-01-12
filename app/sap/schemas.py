@@ -47,18 +47,17 @@ class IntakeFormRequest(BaseModel):
 
 class IntakeFormResponse(BaseModel):
     """Response after intake form submission"""
-    success: bool
     student_uuid: UUID
     message: str
-    intake_id: int
+    status: str
 
 
 class IntakeStatusResponse(BaseModel):
     """Intake processing status (non-PHI)"""
     student_uuid: UUID
-    service_status: str
-    processed: bool
-    message: str
+    status: str
+    submitted_date: Optional[str]  # ISO 8601 datetime
+    processed_date: Optional[str]  # ISO 8601 datetime
 
 
 # Dashboard Schemas

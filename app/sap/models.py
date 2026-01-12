@@ -93,6 +93,8 @@ class IntakeQueue(Base):
     dashboard_record_id = Column(Integer, ForeignKey("dashboard_records.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
     
     # Encrypted PHI Fields (BYTEA = binary data)
+    student_first_name_encrypted = Column(BYTEA, nullable=False)
+    student_last_name_encrypted = Column(BYTEA, nullable=False)
     student_full_name_encrypted = Column(BYTEA, nullable=False)
     student_id_encrypted = Column(BYTEA)
     date_of_birth_encrypted = Column(BYTEA)
@@ -110,6 +112,24 @@ class IntakeQueue(Base):
     group_number_encrypted = Column(BYTEA)
     insurance_card_front_url = Column(Text)  # Encrypted storage path
     insurance_card_back_url = Column(Text)    # Encrypted storage path
+    
+    # Service Needs (Encrypted - contains PHI context)
+    service_category_encrypted = Column(BYTEA)  # JSON array encrypted
+    service_category_other_encrypted = Column(BYTEA)
+    severity_of_concern_encrypted = Column(BYTEA)
+    type_of_service_needed_encrypted = Column(BYTEA)  # JSON array encrypted
+    family_resources_encrypted = Column(BYTEA)  # JSON array encrypted, nullable
+    referral_concern_encrypted = Column(BYTEA)  # JSON array encrypted, nullable
+    
+    # Demographics (Encrypted - PHI)
+    sex_at_birth_encrypted = Column(BYTEA)
+    race_encrypted = Column(BYTEA)  # JSON array encrypted
+    race_other_encrypted = Column(BYTEA)
+    ethnicity_encrypted = Column(BYTEA)  # JSON array encrypted
+    
+    # Safety & Authorization
+    immediate_safety_concern = Column(Boolean, nullable=False)  # Non-PHI, can be stored unencrypted
+    authorization_consent = Column(Boolean, nullable=False)  # Non-PHI
     
     # Processing Status
     processed = Column(Boolean, default=False, index=True)
