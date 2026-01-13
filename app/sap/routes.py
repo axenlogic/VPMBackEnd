@@ -19,7 +19,7 @@ from app.sap.models import (
 )
 from app.sap.schemas import IntakeFormResponse, IntakeStatusResponse
 from app.sap.utils import (
-    encrypt_phi, decrypt_phi, calculate_grade_band, 
+    calculate_grade_band, 
     calculate_fiscal_period, calculate_expires_at
 )
 from app.sap.security import validate_captcha, get_client_ip, check_duplicate_submission
@@ -248,6 +248,8 @@ async def submit_intake_form(
                 detail="date_of_birth must be in YYYY-MM-DD format"
             )
         
+        # Store dob_date for later use in intake_queue
+        
         # 9. Check for duplicate submissions
         client_ip = get_client_ip(request)
         if check_duplicate_submission(
@@ -300,10 +302,12 @@ async def submit_intake_form(
         fiscal_period = calculate_fiscal_period(referral_date)
         
         # 13. Create dashboard record (non-PHI)
+        # Store student name directly for easy dashboard display (simplified approach)
         dashboard_record = DashboardRecord(
             student_uuid=student_uuid,
             district_id=school.district_id,
             school_id=school.id,
+            student_name=student_full_name,  # Store name directly (non-encrypted for simplicity)
             grade_band=grade_band,
             referral_source="parent",  # Default, can be enhanced
             opt_in_type=opt_in_type,
@@ -333,39 +337,40 @@ async def submit_intake_form(
                 "back"
             )
         
-        # 15. Encrypt PHI and create intake queue record
+        # 15. Create intake queue record (plain text - no encryption)
+        # Note: student_name is stored in dashboard_record above (line 310) for easy API access
         intake_queue = IntakeQueue(
             dashboard_record_id=dashboard_record.id,
-            # Student Information (Encrypted)
-            student_first_name_encrypted=encrypt_phi(student_first_name),
-            student_last_name_encrypted=encrypt_phi(student_last_name),
-            student_full_name_encrypted=encrypt_phi(student_full_name),
-            student_id_encrypted=encrypt_phi(student_id) if student_id else None,
-            date_of_birth_encrypted=encrypt_phi(student_dob),
-            # Parent/Guardian Contact (Encrypted)
-            parent_name_encrypted=encrypt_phi(parent_name),
-            parent_email_encrypted=encrypt_phi(parent_email),
-            parent_phone_encrypted=encrypt_phi(parent_phone),
-            # Insurance Information (Encrypted)
-            insurance_company_encrypted=encrypt_phi(insurance_company) if insurance_company else None,
-            policyholder_name_encrypted=encrypt_phi(policyholder_name) if policyholder_name else None,
-            relationship_to_student_encrypted=encrypt_phi(relationship) if relationship else None,
-            member_id_encrypted=encrypt_phi(member_id) if member_id else None,
-            group_number_encrypted=encrypt_phi(group_number) if group_number else None,
+            # Student Information (Plain text)
+            student_first_name=student_first_name,
+            student_last_name=student_last_name,
+            student_full_name=student_full_name,
+            student_id=student_id if student_id else None,
+            date_of_birth=dob_date,
+            # Parent/Guardian Contact (Plain text)
+            parent_name=parent_name,
+            parent_email=parent_email,
+            parent_phone=parent_phone,
+            # Insurance Information (Plain text)
+            insurance_company=insurance_company if insurance_company else None,
+            policyholder_name=policyholder_name if policyholder_name else None,
+            relationship_to_student=relationship if relationship else None,
+            member_id=member_id if member_id else None,
+            group_number=group_number if group_number else None,
             insurance_card_front_url=front_card_path,
             insurance_card_back_url=back_card_path,
-            # Service Needs (Encrypted)
-            service_category_encrypted=encrypt_phi(json.dumps(service_category)),
-            service_category_other_encrypted=encrypt_phi(service_category_other) if service_category_other else None,
-            severity_of_concern_encrypted=encrypt_phi(severity_of_concern),
-            type_of_service_needed_encrypted=encrypt_phi(json.dumps(type_of_service_needed)),
-            family_resources_encrypted=encrypt_phi(json.dumps(family_resources)) if family_resources else None,
-            referral_concern_encrypted=encrypt_phi(json.dumps(referral_concern)) if referral_concern else None,
-            # Demographics (Encrypted)
-            sex_at_birth_encrypted=encrypt_phi(sex_at_birth) if sex_at_birth else None,
-            race_encrypted=encrypt_phi(json.dumps(race)) if race else None,
-            race_other_encrypted=encrypt_phi(race_other) if race_other else None,
-            ethnicity_encrypted=encrypt_phi(json.dumps(ethnicity)) if ethnicity else None,
+            # Service Needs (Plain text - JSON as text)
+            service_category=json.dumps(service_category),
+            service_category_other=service_category_other if service_category_other else None,
+            severity_of_concern=severity_of_concern,
+            type_of_service_needed=json.dumps(type_of_service_needed),
+            family_resources=json.dumps(family_resources) if family_resources else None,
+            referral_concern=json.dumps(referral_concern) if referral_concern else None,
+            # Demographics (Plain text)
+            sex_at_birth=sex_at_birth if sex_at_birth else None,
+            race=json.dumps(race) if race else None,
+            race_other=race_other if race_other else None,
+            ethnicity=json.dumps(ethnicity) if ethnicity else None,
             # Safety & Authorization
             immediate_safety_concern=safety_concern,
             authorization_consent=True,

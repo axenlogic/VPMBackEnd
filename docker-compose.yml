@@ -43,9 +43,6 @@ services:
       SMTP_EMAIL: ${SMTP_EMAIL:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
 
-      # Encryption (for PHI)
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
-
       # Frontend URLs
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
       FRONTEND_URL_8081: ${FRONTEND_URL_8081:-http://localhost:8000}

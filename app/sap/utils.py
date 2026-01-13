@@ -1,61 +1,6 @@
 """
 SAP Data Dashboard - Utility Functions
-
-Encryption/Decryption for PHI
 """
-
-from cryptography.fernet import Fernet
-import os
-import base64
-from typing import Optional
-from app.core.config import settings
-
-
-# Encryption key management
-# In production, use Google Cloud KMS or AWS KMS
-def get_encryption_key() -> bytes:
-    """Get encryption key from environment or generate if not exists"""
-    key_str = os.getenv("ENCRYPTION_KEY")
-    if not key_str:
-        # Generate a new key (for development only)
-        # In production, this should be stored in KMS
-        key = Fernet.generate_key()
-        print(f"WARNING: Generated new encryption key. Store this in ENCRYPTION_KEY env var: {key.decode()}")
-        return key
-    return key_str.encode()
-
-
-_fernet = None
-
-
-def get_fernet() -> Fernet:
-    """Get Fernet cipher instance (singleton)"""
-    global _fernet
-    if _fernet is None:
-        key = get_encryption_key()
-        _fernet = Fernet(key)
-    return _fernet
-
-
-def encrypt_phi(data: str) -> bytes:
-    """Encrypt PHI data"""
-    if not data:
-        return b''
-    fernet = get_fernet()
-    return fernet.encrypt(data.encode('utf-8'))
-
-
-def decrypt_phi(encrypted_data: bytes) -> Optional[str]:
-    """Decrypt PHI data"""
-    if not encrypted_data:
-        return None
-    try:
-        fernet = get_fernet()
-        decrypted = fernet.decrypt(encrypted_data)
-        return decrypted.decode('utf-8')
-    except Exception as e:
-        print(f"Decryption error: {e}")
-        return None
 
 
 def calculate_grade_band(grade_level: str) -> str:

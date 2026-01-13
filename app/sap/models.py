@@ -3,11 +3,11 @@ SAP Data Dashboard - Database Models
 
 Dual-record system:
 1. Dashboard Records (non-PHI, permanent)
-2. Intake Queue Records (PHI, temporary, encrypted)
+2. Intake Queue Records (PHI, temporary, plain text)
 """
 
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Text, ARRAY, JSON
-from sqlalchemy.dialects.postgresql import UUID, BYTEA, INET
+from sqlalchemy.dialects.postgresql import UUID, INET
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 import uuid
@@ -61,6 +61,7 @@ class DashboardRecord(Base):
     school_id = Column(Integer, ForeignKey("schools.id"), nullable=False, index=True)
     
     # Non-PHI data
+    student_name = Column(String(200), nullable=True)  # Student name (stored for dashboard display) - nullable for backward compatibility
     grade_band = Column(String(20))  # 'K-5', '6-8', '9-12'
     referral_source = Column(String(100))  # 'parent', 'teacher', 'counselor'
     opt_in_type = Column(String(50), nullable=False)  # 'immediate_service', 'future_eligibility'
@@ -86,46 +87,46 @@ class DashboardRecord(Base):
 
 
 class IntakeQueue(Base):
-    """PHI intake queue records (temporary, encrypted)"""
+    """Intake queue records (temporary, plain text - no encryption)"""
     __tablename__ = "intake_queue"
     
     id = Column(Integer, primary_key=True, index=True)
     dashboard_record_id = Column(Integer, ForeignKey("dashboard_records.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
     
-    # Encrypted PHI Fields (BYTEA = binary data)
-    student_first_name_encrypted = Column(BYTEA, nullable=False)
-    student_last_name_encrypted = Column(BYTEA, nullable=False)
-    student_full_name_encrypted = Column(BYTEA, nullable=False)
-    student_id_encrypted = Column(BYTEA)
-    date_of_birth_encrypted = Column(BYTEA)
+    # Student Information (Plain text - no encryption)
+    student_first_name = Column(String(100), nullable=False)
+    student_last_name = Column(String(100), nullable=False)
+    student_full_name = Column(String(200), nullable=False)
+    student_id = Column(String(50))
+    date_of_birth = Column(Date)
     
-    # Parent/Guardian Contact (Encrypted)
-    parent_name_encrypted = Column(BYTEA, nullable=False)
-    parent_email_encrypted = Column(BYTEA, nullable=False)
-    parent_phone_encrypted = Column(BYTEA, nullable=False)
+    # Parent/Guardian Contact (Plain text)
+    parent_name = Column(String(200), nullable=False)
+    parent_email = Column(String(200), nullable=False)
+    parent_phone = Column(String(50), nullable=False)
     
-    # Insurance Information (Encrypted)
-    insurance_company_encrypted = Column(BYTEA)
-    policyholder_name_encrypted = Column(BYTEA)
-    relationship_to_student_encrypted = Column(BYTEA)
-    member_id_encrypted = Column(BYTEA)
-    group_number_encrypted = Column(BYTEA)
-    insurance_card_front_url = Column(Text)  # Encrypted storage path
-    insurance_card_back_url = Column(Text)    # Encrypted storage path
+    # Insurance Information (Plain text)
+    insurance_company = Column(String(200))
+    policyholder_name = Column(String(200))
+    relationship_to_student = Column(String(100))
+    member_id = Column(String(100))
+    group_number = Column(String(100))
+    insurance_card_front_url = Column(Text)
+    insurance_card_back_url = Column(Text)
     
-    # Service Needs (Encrypted - contains PHI context)
-    service_category_encrypted = Column(BYTEA)  # JSON array encrypted
-    service_category_other_encrypted = Column(BYTEA)
-    severity_of_concern_encrypted = Column(BYTEA)
-    type_of_service_needed_encrypted = Column(BYTEA)  # JSON array encrypted
-    family_resources_encrypted = Column(BYTEA)  # JSON array encrypted, nullable
-    referral_concern_encrypted = Column(BYTEA)  # JSON array encrypted, nullable
+    # Service Needs (Plain text - JSON stored as text)
+    service_category = Column(Text)  # JSON array as text
+    service_category_other = Column(Text)
+    severity_of_concern = Column(String(50))
+    type_of_service_needed = Column(Text)  # JSON array as text
+    family_resources = Column(Text)  # JSON array as text, nullable
+    referral_concern = Column(Text)  # JSON array as text, nullable
     
-    # Demographics (Encrypted - PHI)
-    sex_at_birth_encrypted = Column(BYTEA)
-    race_encrypted = Column(BYTEA)  # JSON array encrypted
-    race_other_encrypted = Column(BYTEA)
-    ethnicity_encrypted = Column(BYTEA)  # JSON array encrypted
+    # Demographics (Plain text)
+    sex_at_birth = Column(String(50))
+    race = Column(Text)  # JSON array as text
+    race_other = Column(String(200))
+    ethnicity = Column(Text)  # JSON array as text
     
     # Safety & Authorization
     immediate_safety_concern = Column(Boolean, nullable=False)  # Non-PHI, can be stored unencrypted

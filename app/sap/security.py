@@ -164,32 +164,30 @@ def check_duplicate_submission(
     Returns True if duplicate found
     """
     from datetime import datetime, timedelta, timezone
-    from app.sap.models import IntakeQueue, DashboardRecord
-    from app.sap.utils import decrypt_phi
+    from app.sap.models import IntakeQueue
     
     cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
     
-    # Query recent intake queue records
-    recent_intakes = db.query(IntakeQueue).join(DashboardRecord).filter(
+    # Query recent intake queue records (plain text now)
+    recent_intakes = db.query(IntakeQueue).filter(
         IntakeQueue.created_at >= cutoff_time
     ).all()
     
     for intake in recent_intakes:
-        try:
-            # Decrypt and compare
-            stored_first = decrypt_phi(intake.student_first_name_encrypted)
-            stored_last = decrypt_phi(intake.student_last_name_encrypted)
-            stored_dob = decrypt_phi(intake.date_of_birth_encrypted)
-            stored_email = decrypt_phi(intake.parent_email_encrypted)
-            
-            if (stored_first and stored_first.lower() == student_first_name.lower() and
-                stored_last and stored_last.lower() == student_last_name.lower() and
-                stored_dob == date_of_birth and
-                stored_email and stored_email.lower() == parent_email.lower()):
-                return True
-        except Exception:
-            # If decryption fails, skip this record
-            continue
+        # Compare plain text fields
+        stored_first = getattr(intake, 'student_first_name', None) or ""
+        stored_last = getattr(intake, 'student_last_name', None) or ""
+        stored_dob = getattr(intake, 'date_of_birth', None)
+        stored_email = getattr(intake, 'parent_email', None) or ""
+        
+        # Format date for comparison
+        stored_dob_str = stored_dob.strftime("%Y-%m-%d") if stored_dob else None
+        
+        if (stored_first.lower() == student_first_name.lower() and
+            stored_last.lower() == student_last_name.lower() and
+            stored_dob_str == date_of_birth and
+            stored_email.lower() == parent_email.lower()):
+            return True
     
     return False
 

@@ -60,6 +60,10 @@ app.include_router(auth_routes.router, prefix="/auth", tags=["Auth"])
 from app.sap import routes as sap_routes
 app.include_router(sap_routes.router, tags=["Intake"])
 
+# Include SAP dashboard routes (protected endpoints)
+from app.sap import dashboard_routes as sap_dashboard_routes
+app.include_router(sap_dashboard_routes.router, tags=["Dashboard"])
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -74,7 +78,24 @@ def root():
 def on_startup() -> None:
     # Initialize tables on startup, but don't crash service if DB is unavailable
     try:
+        from sqlalchemy import text
+        
+        # Create all tables
         Base.metadata.create_all(bind=engine)
+        print("✅ Database tables initialized successfully")
+        
+        # Add student_name column if it doesn't exist (migration)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    ALTER TABLE dashboard_records 
+                    ADD COLUMN IF NOT EXISTS student_name VARCHAR(200);
+                """))
+                conn.commit()
+                print("✅ student_name column added/verified successfully")
+        except Exception as col_exc:
+            # Column might already exist or there's a permission issue - that's okay
+            print(f"Note: student_name column check: {col_exc}")
     except Exception as exc:
         # Log and continue so health checks still pass
         print(f"Startup DB init skipped: {exc}")
