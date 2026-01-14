@@ -98,6 +98,7 @@ class IntakeQueue(Base):
     student_last_name = Column(String(100), nullable=False)
     student_full_name = Column(String(200), nullable=False)
     student_id = Column(String(50))
+    student_grade = Column(String(20))  # Store actual grade (e.g., "5", "K", "12")
     date_of_birth = Column(Date)
     
     # Parent/Guardian Contact (Plain text)

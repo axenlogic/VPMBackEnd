@@ -162,3 +162,71 @@ class CreateOutcomeRequest(BaseModel):
     outcome_value: str = Field(..., description="Aggregate data only, no PHI")
     measured_date: date
 
+
+# Intake Form Details Response Schema
+class StudentInformation(BaseModel):
+    """Student information section"""
+    first_name: str
+    last_name: str
+    full_name: str
+    student_id: Optional[str]
+    grade: str
+    school: str
+    date_of_birth: str  # YYYY-MM-DD format
+
+
+class ParentGuardianContact(BaseModel):
+    """Parent/guardian contact section"""
+    name: str
+    email: str
+    phone: str
+
+
+class InsuranceInformation(BaseModel):
+    """Insurance information section"""
+    has_insurance: str  # "yes" or "no"
+    insurance_company: Optional[str]
+    policyholder_name: Optional[str]
+    relationship_to_student: Optional[str]
+    member_id: Optional[str]
+    group_number: Optional[str]
+    insurance_card_front_url: Optional[str]
+    insurance_card_back_url: Optional[str]
+
+
+class ServiceNeeds(BaseModel):
+    """Service needs section"""
+    service_category: List[str]
+    service_category_other: Optional[str]
+    severity_of_concern: str
+    type_of_service_needed: List[str]
+    family_resources: Optional[List[str]]
+    referral_concern: Optional[List[str]]
+
+
+class Demographics(BaseModel):
+    """Demographics section (optional)"""
+    sex_at_birth: Optional[str]
+    race: Optional[List[str]]
+    race_other: Optional[str]
+    ethnicity: Optional[List[str]]
+
+
+class IntakeFormDetailsResponse(BaseModel):
+    """Complete intake form details with all PHI"""
+    id: str  # Student UUID
+    student_uuid: str  # Student UUID
+    status: str  # "pending", "processed", "active", or "submitted"
+    submitted_date: str  # ISO 8601 datetime
+    processed_date: Optional[str]  # ISO 8601 datetime or null
+    
+    student_information: StudentInformation
+    parent_guardian_contact: ParentGuardianContact
+    service_request_type: str  # "start_now" or "opt_in_future"
+    insurance_information: InsuranceInformation
+    service_needs: ServiceNeeds
+    demographics: Optional[Demographics]
+    immediate_safety_concern: str  # "yes" or "no"
+    authorization_consent: bool
+    updated_date: Optional[str]  # ISO 8601 datetime, for update endpoint
+

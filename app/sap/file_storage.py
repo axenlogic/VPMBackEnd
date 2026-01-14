@@ -56,7 +56,7 @@ async def save_insurance_card(
     side: str  # "front" or "back"
 ) -> str:
     """
-    Save insurance card image and return file path
+    Save insurance card image and return filename
     
     Args:
         file: Uploaded file
@@ -64,7 +64,7 @@ async def save_insurance_card(
         side: "front" or "back"
     
     Returns:
-        File path relative to upload directory
+        Filename (not full path) for database storage
     """
     # Validate file
     is_valid, error = validate_image_file(file)
@@ -91,10 +91,9 @@ async def save_insurance_card(
                 status_code=400,
                 detail=f"Invalid image file: {str(e)}"
             )
-    # If Pillow is not available, skip image validation (not recommended for production)
     
     # Generate unique filename
-    file_ext = Path(file.filename).suffix.lower()
+    file_ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
     unique_filename = f"{student_uuid}_{side}_{uuid.uuid4().hex[:8]}{file_ext}"
     
     # Ensure upload directory exists
@@ -105,8 +104,9 @@ async def save_insurance_card(
     with open(file_path, "wb") as f:
         f.write(content)
     
-    # Return relative path (for database storage)
-    return str(file_path.relative_to(Path.cwd()))
+    # Return filename only (we'll use the filename to serve files)
+    # This makes it easier to construct URLs and serve files
+    return unique_filename
 
 
 async def delete_insurance_card(file_path: str):

@@ -5,19 +5,22 @@ PUBLIC ENDPOINTS - No authentication required
 Implements security measures: rate limiting, CAPTCHA, input validation
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from fastapi import UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 import json
+from pathlib import Path
+import os
 
 from app.db.database import get_db
 from app.sap.models import (
     District, School, DashboardRecord, IntakeQueue, AuditLog
 )
-from app.sap.schemas import IntakeFormResponse, IntakeStatusResponse
+from app.sap.schemas import IntakeFormResponse, IntakeStatusResponse, IntakeFormDetailsResponse
 from app.sap.utils import (
     calculate_grade_band, 
     calculate_fiscal_period, calculate_expires_at
@@ -25,6 +28,8 @@ from app.sap.utils import (
 from app.sap.security import validate_captcha, get_client_ip, check_duplicate_submission
 from app.sap.file_storage import save_insurance_card
 from app.core.config import settings
+from app.auth.routes import get_user_from_token
+from app.auth.models import User
 
 router = APIRouter()
 
@@ -33,13 +38,27 @@ async def parse_multipart_form(request: Request) -> dict:
     """
     Parse multipart form data with nested field names
     Returns dict with all form fields and files
+    
+    FastAPI's form() method handles files correctly, but we need to check
+    both the form items and also look for UploadFile instances directly.
     """
     form_data = {}
     files = {}
     
     form = await request.form()
+    
+    # First pass: separate files from form data
     for key, value in form.items():
-        if isinstance(value, UploadFile):
+        # Check if it's an UploadFile instance
+        # FastAPI returns UploadFile for file fields
+        # Also check for SpooledTemporaryFile which FastAPI uses internally
+        is_file = (
+            isinstance(value, UploadFile) or
+            (hasattr(value, 'filename') and value.filename) or
+            (hasattr(value, 'read') and hasattr(value, 'file') and not isinstance(value, str))
+        )
+        
+        if is_file:
             files[key] = value
         else:
             form_data[key] = value
@@ -140,9 +159,17 @@ async def submit_intake_form(
         # CAPTCHA
         captcha_token = parse_nested_field(form_data, "captcha_token")
         
-        # File uploads
-        insurance_card_front = files.get("insurance_information.insurance_card_front")
-        insurance_card_back = files.get("insurance_information.insurance_card_back")
+        # File uploads - try multiple possible key formats
+        insurance_card_front = (
+            files.get("insurance_information.insurance_card_front") or
+            files.get("insurance_card_front") or
+            None
+        )
+        insurance_card_back = (
+            files.get("insurance_information.insurance_card_back") or
+            files.get("insurance_card_back") or
+            None
+        )
         
         # 3. Validate required fields
         required_fields = {
@@ -180,8 +207,11 @@ async def submit_intake_form(
             )
         
         # 6. Parse boolean values
-        has_insurance = has_insurance_str.lower() == "true"
-        safety_concern = safety_concern_str.lower() == "true"
+        # Handle both "yes"/"no" and "true"/"false" formats
+        has_insurance_lower = has_insurance_str.lower() if has_insurance_str else ""
+        has_insurance = has_insurance_lower in ["yes", "true", "1"]
+        safety_concern_lower = safety_concern_str.lower() if safety_concern_str else ""
+        safety_concern = safety_concern_lower in ["yes", "true", "1"]
         
         # 7. Validate insurance fields if has_insurance is true
         if has_insurance:
@@ -346,6 +376,7 @@ async def submit_intake_form(
             student_last_name=student_last_name,
             student_full_name=student_full_name,
             student_id=student_id if student_id else None,
+            student_grade=student_grade,  # Store actual grade
             date_of_birth=dob_date,
             # Parent/Guardian Contact (Plain text)
             parent_name=parent_name,
@@ -491,5 +522,815 @@ async def check_intake_status(
         raise HTTPException(
             status_code=500,
             detail="An error occurred. Please try again later."
+        )
+
+
+def get_file_url(file_path: Optional[str], request: Request = None, token: Optional[str] = None) -> Optional[str]:
+    """
+    Convert file path to API endpoint URL with optional token
+    Files are served via /api/v1/files/insurance/{filename}?token={jwt_token}
+    Token allows images to be displayed in <img> tags without CORS issues
+    """
+    if not file_path:
+        return None
+    
+    # If already a full URL, return as-is
+    if file_path.startswith(("http://", "https://")):
+        return file_path
+    
+    # Extract filename from path
+    filename = Path(file_path).name
+    
+    # Construct URL to file serving endpoint
+    if request:
+        base_url = str(request.base_url).rstrip('/')
+        url = f"{base_url}/api/v1/files/insurance/{filename}"
+        # Add token as query parameter if provided (for img tag compatibility)
+        if token:
+            url += f"?token={token}"
+        return url
+    
+    # Fallback: return relative path
+    return f"/api/v1/files/insurance/{filename}"
+
+
+@router.get("/api/v1/intake/details/{identifier}", response_model=IntakeFormDetailsResponse)
+async def get_intake_form_details(
+    identifier: str,
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Get complete intake form details by student UUID or form ID
+    
+    Requires JWT authentication.
+    Access Control:
+    - vpm_admin: Can access all forms
+    - district_admin: Can access forms within their assigned district
+    - district_viewer: Can access forms within their assigned district (read-only)
+    """
+    try:
+        # 1. Authenticate user
+        user = get_user_from_token(authorization, db)
+        
+        # 2. Find dashboard record by student_uuid
+        try:
+            student_uuid = UUID(identifier)
+        except ValueError:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form not found. Please verify the identifier and try again."
+            )
+        
+        dashboard_record = db.query(DashboardRecord).filter(
+            DashboardRecord.student_uuid == student_uuid
+        ).first()
+        
+        if not dashboard_record:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form not found. Please verify the identifier and try again."
+            )
+        
+        # 3. Check access control (for now, all authenticated users can access)
+        # TODO: Implement role-based access when User model has role/district_id fields
+        # if user.role != "vpm_admin" and user.district_id != dashboard_record.district_id:
+        #     raise HTTPException(
+        #         status_code=403,
+        #         detail="You do not have permission to access this intake form."
+        #     )
+        
+        # 4. Get intake queue record
+        intake_queue = db.query(IntakeQueue).filter(
+            IntakeQueue.dashboard_record_id == dashboard_record.id
+        ).first()
+        
+        if not intake_queue:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form details not found. The form may have been processed and removed."
+            )
+        
+        # 5. Get school information
+        school = dashboard_record.school
+        if not school:
+            raise HTTPException(
+                status_code=500,
+                detail="An internal server error occurred. Please try again later."
+            )
+        
+        # 6. Parse JSON arrays from text fields
+        def parse_json_array(text_value: Optional[str]) -> List[str]:
+            """Parse JSON array from text field, return empty list if None or invalid"""
+            if not text_value:
+                return []
+            try:
+                parsed = json.loads(text_value)
+                if isinstance(parsed, list):
+                    return parsed
+                return []
+            except:
+                return []
+        
+        # 7. Map service_status to response status
+        status_map = {
+            "pending": "pending",
+            "active": "active",
+            "processed": "processed",
+            "completed": "processed",
+            "cancelled": "processed",
+            "submitted": "submitted"
+        }
+        response_status = status_map.get(dashboard_record.service_status, "pending")
+        
+        # 8. Map opt_in_type to service_request_type
+        opt_in_map = {
+            "immediate_service": "start_now",
+            "future_eligibility": "opt_in_future"
+        }
+        service_request_type = opt_in_map.get(dashboard_record.opt_in_type, "start_now")
+        
+        # 9. Get grade from intake queue
+        grade = intake_queue.student_grade or "N/A"
+        
+        # 10. Build file URLs with token for img tag compatibility
+        # Extract token from authorization header for query parameter
+        auth_token = None
+        if authorization and authorization.startswith("Bearer "):
+            auth_token = authorization.replace("Bearer ", "")
+        
+        front_card_url = get_file_url(intake_queue.insurance_card_front_url, request, auth_token)
+        back_card_url = get_file_url(intake_queue.insurance_card_back_url, request, auth_token)
+        
+        # 11. Format dates
+        submitted_date = dashboard_record.created_at.isoformat() if dashboard_record.created_at else None
+        processed_date = intake_queue.processed_at.isoformat() if intake_queue.processed_at and intake_queue.processed else None
+        updated_date = dashboard_record.updated_at.isoformat() if dashboard_record.updated_at else None
+        dob_str = intake_queue.date_of_birth.strftime("%Y-%m-%d") if intake_queue.date_of_birth else None
+        
+        # 12. Build response
+        from app.sap.schemas import (
+            StudentInformation, ParentGuardianContact, InsuranceInformation,
+            ServiceNeeds, Demographics
+        )
+        
+        # Student Information
+        student_info = StudentInformation(
+            first_name=intake_queue.student_first_name,
+            last_name=intake_queue.student_last_name,
+            full_name=intake_queue.student_full_name,
+            student_id=intake_queue.student_id or None,
+            grade=grade,
+            school=school.name,
+            date_of_birth=dob_str or ""
+        )
+        
+        # Parent/Guardian Contact
+        parent_contact = ParentGuardianContact(
+            name=intake_queue.parent_name,
+            email=intake_queue.parent_email,
+            phone=intake_queue.parent_phone
+        )
+        
+        # Insurance Information
+        has_insurance_str = "yes" if dashboard_record.insurance_present else "no"
+        insurance_info = InsuranceInformation(
+            has_insurance=has_insurance_str,
+            insurance_company=intake_queue.insurance_company if dashboard_record.insurance_present else None,
+            policyholder_name=intake_queue.policyholder_name if dashboard_record.insurance_present else None,
+            relationship_to_student=intake_queue.relationship_to_student if dashboard_record.insurance_present else None,
+            member_id=intake_queue.member_id if dashboard_record.insurance_present else None,
+            group_number=intake_queue.group_number if dashboard_record.insurance_present else None,
+            insurance_card_front_url=front_card_url if dashboard_record.insurance_present else None,
+            insurance_card_back_url=back_card_url if dashboard_record.insurance_present else None
+        )
+        
+        # Service Needs
+        service_needs = ServiceNeeds(
+            service_category=parse_json_array(intake_queue.service_category),
+            service_category_other=intake_queue.service_category_other,
+            severity_of_concern=intake_queue.severity_of_concern or "mild",
+            type_of_service_needed=parse_json_array(intake_queue.type_of_service_needed),
+            family_resources=parse_json_array(intake_queue.family_resources) if intake_queue.family_resources else None,
+            referral_concern=parse_json_array(intake_queue.referral_concern) if intake_queue.referral_concern else None
+        )
+        
+        # Demographics (optional)
+        demographics = None
+        if intake_queue.sex_at_birth or intake_queue.race or intake_queue.ethnicity:
+            demographics = Demographics(
+                sex_at_birth=intake_queue.sex_at_birth,
+                race=parse_json_array(intake_queue.race) if intake_queue.race else None,
+                race_other=intake_queue.race_other,
+                ethnicity=parse_json_array(intake_queue.ethnicity) if intake_queue.ethnicity else None
+            )
+        
+        # Safety concern
+        safety_concern_str = "yes" if intake_queue.immediate_safety_concern else "no"
+        
+        # 13. Log audit trail
+        client_ip = get_client_ip(request)
+        audit_log = AuditLog(
+            user_id=user.id,
+            action="view",
+            resource_type="intake_form_details",
+            resource_id=dashboard_record.id,
+            district_id=dashboard_record.district_id,
+            ip_address=client_ip,
+            user_agent=request.headers.get("user-agent"),
+            details={"student_uuid": str(student_uuid)}
+        )
+        db.add(audit_log)
+        db.commit()
+        
+        # 14. Return response
+        return IntakeFormDetailsResponse(
+            id=str(student_uuid),
+            student_uuid=str(student_uuid),
+            status=response_status,
+            submitted_date=submitted_date or "",
+            processed_date=processed_date,
+            updated_date=updated_date,
+            student_information=student_info,
+            parent_guardian_contact=parent_contact,
+            service_request_type=service_request_type,
+            insurance_information=insurance_info,
+            service_needs=service_needs,
+            demographics=demographics,
+            immediate_safety_concern=safety_concern_str,
+            authorization_consent=intake_queue.authorization_consent
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching intake form details: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An internal server error occurred. Please try again later."
+        )
+
+
+@router.put("/api/v1/intake/update/{identifier}", response_model=IntakeFormDetailsResponse)
+async def update_intake_form(
+    identifier: str,
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Update an existing intake form
+    
+    Requires JWT authentication.
+    Supports partial updates - only provided fields will be updated.
+    File uploads replace existing files if provided, otherwise existing files are retained.
+    """
+    try:
+        # 1. Authenticate user
+        user = get_user_from_token(authorization, db)
+        
+        # 2. Find dashboard record by student_uuid
+        try:
+            student_uuid = UUID(identifier)
+        except ValueError:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form not found. Please verify the identifier and try again."
+            )
+        
+        dashboard_record = db.query(DashboardRecord).filter(
+            DashboardRecord.student_uuid == student_uuid
+        ).first()
+        
+        if not dashboard_record:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form not found. Please verify the identifier and try again."
+            )
+        
+        # 3. Check access control (for now, all authenticated users can update)
+        # TODO: Implement role-based access when User model has role/district_id fields
+        
+        # 4. Get intake queue record
+        intake_queue = db.query(IntakeQueue).filter(
+            IntakeQueue.dashboard_record_id == dashboard_record.id
+        ).first()
+        
+        if not intake_queue:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form details not found. The form may have been processed and removed."
+            )
+        
+        # 5. Parse multipart form data
+        parsed = await parse_multipart_form(request)
+        form_data = parsed["form"]
+        files = parsed["files"]
+        
+        # 6. Track what sections are being updated (for partial updates)
+        update_student_info = any(k.startswith("student_information.") for k in form_data.keys())
+        update_parent_info = any(k.startswith("parent_guardian_contact.") for k in form_data.keys())
+        update_insurance = any(k.startswith("insurance_information.") for k in form_data.keys()) or any("insurance_card" in k for k in files.keys())
+        update_service_needs = any(k.startswith("service_needs.") for k in form_data.keys())
+        update_demographics = any(k.startswith("demographics.") for k in form_data.keys())
+        
+        # 7. Update Student Information (if provided)
+        if update_student_info:
+            student_first_name = parse_nested_field(form_data, "student_information.first_name")
+            student_last_name = parse_nested_field(form_data, "student_information.last_name")
+            student_grade = parse_nested_field(form_data, "student_information.grade")
+            student_school = parse_nested_field(form_data, "student_information.school")
+            student_dob = parse_nested_field(form_data, "student_information.date_of_birth")
+            student_id = parse_nested_field(form_data, "student_information.student_id")
+            
+            # Validate required fields if section is being updated
+            if not all([student_first_name, student_last_name, student_grade, student_school, student_dob]):
+                raise HTTPException(
+                    status_code=422,
+                    detail="All student information fields are required when updating student information"
+                )
+            
+            # Parse date
+            try:
+                dob_date = datetime.strptime(student_dob, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail="date_of_birth must be in YYYY-MM-DD format"
+                )
+            
+            # Update intake queue
+            intake_queue.student_first_name = student_first_name
+            intake_queue.student_last_name = student_last_name
+            intake_queue.student_full_name = f"{student_first_name} {student_last_name}"
+            intake_queue.student_grade = student_grade
+            intake_queue.student_id = student_id if student_id else None
+            intake_queue.date_of_birth = dob_date
+            
+            # Update dashboard record
+            dashboard_record.student_name = intake_queue.student_full_name
+            dashboard_record.grade_band = calculate_grade_band(student_grade)
+            
+            # Update school if changed
+            if student_school:
+                school = db.query(School).join(District).filter(
+                    School.name.ilike(f"%{student_school.strip()}%")
+                ).first()
+                
+                if school:
+                    dashboard_record.school_id = school.id
+                    dashboard_record.district_id = school.district_id
+        
+        # 8. Update Parent/Guardian Contact (if provided)
+        if update_parent_info:
+            parent_name = parse_nested_field(form_data, "parent_guardian_contact.name")
+            parent_email = parse_nested_field(form_data, "parent_guardian_contact.email")
+            parent_phone = parse_nested_field(form_data, "parent_guardian_contact.phone")
+            
+            # Validate required fields
+            if not all([parent_name, parent_email, parent_phone]):
+                raise HTTPException(
+                    status_code=422,
+                    detail="All parent/guardian contact fields are required when updating contact information"
+                )
+            
+            # Validate email format
+            import re
+            email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+            if not re.match(email_pattern, parent_email):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid email format"
+                )
+            
+            intake_queue.parent_name = parent_name
+            intake_queue.parent_email = parent_email
+            intake_queue.parent_phone = parent_phone
+        
+        # 9. Update Service Request Type (if provided)
+        service_request_type = parse_nested_field(form_data, "service_request_type")
+        if service_request_type:
+            if service_request_type not in ["start_now", "opt_in_future"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail="service_request_type must be 'start_now' or 'opt_in_future'"
+                )
+            opt_in_type = "immediate_service" if service_request_type == "start_now" else "future_eligibility"
+            dashboard_record.opt_in_type = opt_in_type
+        
+        # 10. Update Insurance Information (if provided)
+        if update_insurance:
+            has_insurance_str = parse_nested_field(form_data, "insurance_information.has_insurance")
+            if has_insurance_str:
+                has_insurance_lower = has_insurance_str.lower() if has_insurance_str else ""
+                has_insurance = has_insurance_lower in ["yes", "true", "1"]
+                dashboard_record.insurance_present = has_insurance
+                
+                if has_insurance:
+                    insurance_company = parse_nested_field(form_data, "insurance_information.insurance_company")
+                    policyholder_name = parse_nested_field(form_data, "insurance_information.policyholder_name")
+                    relationship = parse_nested_field(form_data, "insurance_information.relationship_to_student")
+                    member_id = parse_nested_field(form_data, "insurance_information.member_id")
+                    group_number = parse_nested_field(form_data, "insurance_information.group_number")
+                    
+                    # Validate required fields
+                    if not all([insurance_company, policyholder_name, member_id]):
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Insurance company, policyholder name, and member ID are required when has_insurance is 'yes'"
+                        )
+                    
+                    intake_queue.insurance_company = insurance_company
+                    intake_queue.policyholder_name = policyholder_name
+                    intake_queue.relationship_to_student = relationship if relationship else None
+                    intake_queue.member_id = member_id
+                    intake_queue.group_number = group_number if group_number else None
+                else:
+                    # Clear insurance fields if has_insurance is "no"
+                    intake_queue.insurance_company = None
+                    intake_queue.policyholder_name = None
+                    intake_queue.relationship_to_student = None
+                    intake_queue.member_id = None
+                    intake_queue.group_number = None
+                    # Note: Don't delete files here - they're handled separately
+        
+        # 11. Handle file uploads (replace existing if provided)
+        insurance_card_front = files.get("insurance_information.insurance_card_front") or files.get("insurance_card_front")
+        insurance_card_back = files.get("insurance_information.insurance_card_back") or files.get("insurance_card_back")
+        
+        if insurance_card_front:
+            # Delete old file if exists
+            if intake_queue.insurance_card_front_url:
+                try:
+                    old_path = Path(os.getenv("UPLOAD_DIR", "./uploads")) / intake_queue.insurance_card_front_url
+                    if old_path.exists():
+                        old_path.unlink()
+                except:
+                    pass  # Continue even if deletion fails
+            
+            # Save new file
+            front_card_path = await save_insurance_card(
+                insurance_card_front,
+                str(student_uuid),
+                "front"
+            )
+            intake_queue.insurance_card_front_url = front_card_path
+        
+        if insurance_card_back:
+            # Delete old file if exists
+            if intake_queue.insurance_card_back_url:
+                try:
+                    old_path = Path(os.getenv("UPLOAD_DIR", "./uploads")) / intake_queue.insurance_card_back_url
+                    if old_path.exists():
+                        old_path.unlink()
+                except:
+                    pass  # Continue even if deletion fails
+            
+            # Save new file
+            back_card_path = await save_insurance_card(
+                insurance_card_back,
+                str(student_uuid),
+                "back"
+            )
+            intake_queue.insurance_card_back_url = back_card_path
+        
+        # 12. Update Service Needs (if provided)
+        if update_service_needs:
+            service_category = parse_array_field(form_data, "service_needs.service_category")
+            service_category_other = parse_nested_field(form_data, "service_needs.service_category_other")
+            severity_of_concern = parse_nested_field(form_data, "service_needs.severity_of_concern")
+            type_of_service_needed = parse_array_field(form_data, "service_needs.type_of_service_needed")
+            family_resources = parse_array_field(form_data, "service_needs.family_resources")
+            referral_concern = parse_array_field(form_data, "service_needs.referral_concern")
+            
+            # Validate required fields
+            if not service_category:
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one service category is required"
+                )
+            if not severity_of_concern:
+                raise HTTPException(
+                    status_code=422,
+                    detail="severity_of_concern is required"
+                )
+            if severity_of_concern not in ["mild", "moderate", "severe"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail="severity_of_concern must be 'mild', 'moderate', or 'severe'"
+                )
+            if not type_of_service_needed:
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one type of service needed is required"
+                )
+            
+            intake_queue.service_category = json.dumps(service_category)
+            intake_queue.service_category_other = service_category_other if service_category_other else None
+            intake_queue.severity_of_concern = severity_of_concern
+            intake_queue.type_of_service_needed = json.dumps(type_of_service_needed)
+            intake_queue.family_resources = json.dumps(family_resources) if family_resources else None
+            intake_queue.referral_concern = json.dumps(referral_concern) if referral_concern else None
+        
+        # 13. Update Demographics (if provided)
+        if update_demographics:
+            sex_at_birth = parse_nested_field(form_data, "demographics.sex_at_birth")
+            race = parse_array_field(form_data, "demographics.race")
+            race_other = parse_nested_field(form_data, "demographics.race_other")
+            ethnicity = parse_array_field(form_data, "demographics.ethnicity")
+            
+            intake_queue.sex_at_birth = sex_at_birth if sex_at_birth else None
+            intake_queue.race = json.dumps(race) if race else None
+            intake_queue.race_other = race_other if race_other else None
+            intake_queue.ethnicity = json.dumps(ethnicity) if ethnicity else None
+        
+        # 14. Update Safety & Authorization (if provided)
+        safety_concern_str = parse_nested_field(form_data, "immediate_safety_concern")
+        if safety_concern_str:
+            safety_concern_lower = safety_concern_str.lower() if safety_concern_str else ""
+            safety_concern = safety_concern_lower in ["yes", "true", "1"]
+            intake_queue.immediate_safety_concern = safety_concern
+        
+        authorization_consent_str = parse_nested_field(form_data, "authorization_consent")
+        if authorization_consent_str:
+            authorization_consent = authorization_consent_str.lower() == "true"
+            intake_queue.authorization_consent = authorization_consent
+        
+        # 15. Update timestamp
+        dashboard_record.updated_at = datetime.now(timezone.utc)
+        
+        # 16. Commit changes
+        db.commit()
+        
+        # 17. Refresh objects to get updated data
+        db.refresh(dashboard_record)
+        db.refresh(intake_queue)
+        
+        # 18. Build response (reuse logic from details endpoint)
+        school = dashboard_record.school
+        if not school:
+            raise HTTPException(
+                status_code=500,
+                detail="An internal server error occurred. Please try again later."
+            )
+        
+        # Parse JSON arrays
+        def parse_json_array(text_value: Optional[str]) -> List[str]:
+            if not text_value:
+                return []
+            try:
+                parsed = json.loads(text_value)
+                if isinstance(parsed, list):
+                    return parsed
+                return []
+            except:
+                return []
+        
+        # Map status
+        status_map = {
+            "pending": "pending",
+            "active": "active",
+            "processed": "processed",
+            "completed": "processed",
+            "cancelled": "processed",
+            "submitted": "submitted"
+        }
+        response_status = status_map.get(dashboard_record.service_status, "pending")
+        
+        # Map opt_in_type
+        opt_in_map = {
+            "immediate_service": "start_now",
+            "future_eligibility": "opt_in_future"
+        }
+        service_request_type = opt_in_map.get(dashboard_record.opt_in_type, "start_now")
+        
+        # Get grade
+        grade = intake_queue.student_grade or "N/A"
+        
+        # Build file URLs with token
+        auth_token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else None
+        front_card_url = get_file_url(intake_queue.insurance_card_front_url, request, auth_token)
+        back_card_url = get_file_url(intake_queue.insurance_card_back_url, request, auth_token)
+        
+        # Format dates
+        submitted_date = dashboard_record.created_at.isoformat() if dashboard_record.created_at else None
+        processed_date = intake_queue.processed_at.isoformat() if intake_queue.processed_at and intake_queue.processed else None
+        updated_date = dashboard_record.updated_at.isoformat() if dashboard_record.updated_at else None
+        dob_str = intake_queue.date_of_birth.strftime("%Y-%m-%d") if intake_queue.date_of_birth else None
+        
+        # Build response objects
+        from app.sap.schemas import (
+            StudentInformation, ParentGuardianContact, InsuranceInformation,
+            ServiceNeeds, Demographics
+        )
+        
+        student_info = StudentInformation(
+            first_name=intake_queue.student_first_name,
+            last_name=intake_queue.student_last_name,
+            full_name=intake_queue.student_full_name,
+            student_id=intake_queue.student_id or None,
+            grade=grade,
+            school=school.name,
+            date_of_birth=dob_str or ""
+        )
+        
+        parent_contact = ParentGuardianContact(
+            name=intake_queue.parent_name,
+            email=intake_queue.parent_email,
+            phone=intake_queue.parent_phone
+        )
+        
+        has_insurance_str = "yes" if dashboard_record.insurance_present else "no"
+        insurance_info = InsuranceInformation(
+            has_insurance=has_insurance_str,
+            insurance_company=intake_queue.insurance_company if dashboard_record.insurance_present else None,
+            policyholder_name=intake_queue.policyholder_name if dashboard_record.insurance_present else None,
+            relationship_to_student=intake_queue.relationship_to_student if dashboard_record.insurance_present else None,
+            member_id=intake_queue.member_id if dashboard_record.insurance_present else None,
+            group_number=intake_queue.group_number if dashboard_record.insurance_present else None,
+            insurance_card_front_url=front_card_url if dashboard_record.insurance_present else None,
+            insurance_card_back_url=back_card_url if dashboard_record.insurance_present else None
+        )
+        
+        service_needs = ServiceNeeds(
+            service_category=parse_json_array(intake_queue.service_category),
+            service_category_other=intake_queue.service_category_other,
+            severity_of_concern=intake_queue.severity_of_concern or "mild",
+            type_of_service_needed=parse_json_array(intake_queue.type_of_service_needed),
+            family_resources=parse_json_array(intake_queue.family_resources) if intake_queue.family_resources else None,
+            referral_concern=parse_json_array(intake_queue.referral_concern) if intake_queue.referral_concern else None
+        )
+        
+        demographics = None
+        if intake_queue.sex_at_birth or intake_queue.race or intake_queue.ethnicity:
+            demographics = Demographics(
+                sex_at_birth=intake_queue.sex_at_birth,
+                race=parse_json_array(intake_queue.race) if intake_queue.race else None,
+                race_other=intake_queue.race_other,
+                ethnicity=parse_json_array(intake_queue.ethnicity) if intake_queue.ethnicity else None
+            )
+        
+        safety_concern_str = "yes" if intake_queue.immediate_safety_concern else "no"
+        
+        # 19. Log audit trail
+        client_ip = get_client_ip(request)
+        audit_log = AuditLog(
+            user_id=user.id,
+            action="update",
+            resource_type="intake_form",
+            resource_id=dashboard_record.id,
+            district_id=dashboard_record.district_id,
+            ip_address=client_ip,
+            user_agent=request.headers.get("user-agent"),
+            details={"student_uuid": str(student_uuid), "updated_fields": list(form_data.keys())}
+        )
+        db.add(audit_log)
+        db.commit()
+        
+        # 20. Return response
+        return IntakeFormDetailsResponse(
+            id=str(student_uuid),
+            student_uuid=str(student_uuid),
+            status=response_status,
+            submitted_date=submitted_date or "",
+            processed_date=processed_date,
+            updated_date=updated_date,
+            student_information=student_info,
+            parent_guardian_contact=parent_contact,
+            service_request_type=service_request_type,
+            insurance_information=insurance_info,
+            service_needs=service_needs,
+            demographics=demographics,
+            immediate_safety_concern=safety_concern_str,
+            authorization_consent=intake_queue.authorization_consent
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating intake form: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An internal server error occurred. Please try again later."
+        )
+
+
+@router.get("/api/v1/files/insurance/{filename}")
+async def serve_insurance_card(
+    filename: str,
+    request: Request,
+    token: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    Serve insurance card images (protected endpoint)
+    
+    Requires JWT authentication via header or query parameter (for img tag compatibility).
+    Query parameter 'token' allows images to be displayed in <img> tags.
+    """
+    try:
+        # 1. Get token from header or query parameter
+        auth_token = None
+        if authorization and authorization.startswith("Bearer "):
+            auth_token = authorization.replace("Bearer ", "")
+        elif token:
+            auth_token = token
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required. Provide JWT token in Authorization header or 'token' query parameter."
+            )
+        
+        # 2. Authenticate user
+        user = get_user_from_token(f"Bearer {auth_token}", db)
+        
+        # 2. Extract student UUID from filename (format: {student_uuid}_{side}_{random}.ext)
+        # Example: "18ae6a2b-cf45-401b-9ed5-470c23861bdd_front_abc12345.jpg"
+        parts = filename.split('_')
+        if len(parts) < 2:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        student_uuid_str = parts[0]
+        try:
+            student_uuid = UUID(student_uuid_str)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # 3. Verify user has access to this intake form
+        dashboard_record = db.query(DashboardRecord).filter(
+            DashboardRecord.student_uuid == student_uuid
+        ).first()
+        
+        if not dashboard_record:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # TODO: Add role-based access check when User model has role/district_id
+        # if user.role != "vpm_admin" and user.district_id != dashboard_record.district_id:
+        #     raise HTTPException(status_code=403, detail="Access denied")
+        
+        # 4. Find the file path from intake queue
+        intake_queue = db.query(IntakeQueue).filter(
+            IntakeQueue.dashboard_record_id == dashboard_record.id
+        ).first()
+        
+        if not intake_queue:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # 5. Determine which file (front or back) and get stored filename
+        side = "front" if "front" in filename.lower() else "back"
+        stored_filename = intake_queue.insurance_card_front_url if side == "front" else intake_queue.insurance_card_back_url
+        
+        if not stored_filename:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # 6. Verify filename matches what's stored (security check)
+        if stored_filename != filename:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # 7. Resolve file path
+        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+        full_path = Path(upload_dir) / filename
+        
+        # 8. Verify file exists
+        if not full_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # 9. Log access (audit trail)
+        client_ip = get_client_ip(request)
+        audit_log = AuditLog(
+            user_id=user.id,
+            action="view_file",
+            resource_type="insurance_card",
+            resource_id=dashboard_record.id,
+            district_id=dashboard_record.district_id,
+            ip_address=client_ip,
+            user_agent=request.headers.get("user-agent"),
+            details={"filename": filename, "student_uuid": str(student_uuid)}
+        )
+        db.add(audit_log)
+        db.commit()
+        
+        # 10. Serve file
+        return FileResponse(
+            path=str(full_path),
+            media_type="image/jpeg",  # Default, FastAPI will detect actual type
+            filename=filename
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error serving insurance card: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An internal server error occurred. Please try again later."
         )
 
