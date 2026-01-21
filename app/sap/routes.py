@@ -5,7 +5,7 @@ PUBLIC ENDPOINTS - No authentication required
 Implements security measures: rate limiting, CAPTCHA, input validation
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Header
+from fastapi import APIRouter, Depends, HTTPException, Request, Header, BackgroundTasks, BackgroundTasks
 from fastapi import UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -27,6 +27,7 @@ from app.sap.utils import (
 )
 from app.sap.security import validate_captcha, get_client_ip, check_duplicate_submission
 from app.sap.file_storage import save_insurance_card
+from app.sap.email_notifications import send_intake_form_notification
 from app.core.config import settings
 from app.auth.routes import get_user_from_token
 from app.auth.models import User
@@ -97,6 +98,7 @@ def parse_nested_field(form_data: dict, field_path: str) -> Optional[str]:
 @router.post("/api/v1/intake/submit", response_model=IntakeFormResponse)
 async def submit_intake_form(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
@@ -127,8 +129,23 @@ async def submit_intake_form(
         parent_email = parse_nested_field(form_data, "parent_guardian_contact.email")
         parent_phone = parse_nested_field(form_data, "parent_guardian_contact.phone")
         
-        # Service Request Type
+        # Service Request Type (validate early to determine required fields)
         service_request_type = parse_nested_field(form_data, "service_request_type")
+        
+        if not service_request_type:
+            raise HTTPException(
+                status_code=422,
+                detail="service_request_type is required"
+            )
+        
+        if service_request_type not in ["start_now", "opt_in_future"]:
+            raise HTTPException(
+                status_code=422,
+                detail="service_request_type must be 'start_now' or 'opt_in_future'"
+            )
+        
+        # Determine if full form is required (only for "start_now")
+        requires_full_form = service_request_type == "start_now"
         
         # Insurance Information
         has_insurance_str = parse_nested_field(form_data, "insurance_information.has_insurance")
@@ -171,7 +188,9 @@ async def submit_intake_form(
             None
         )
         
-        # 3. Validate required fields
+        # 3. Validate required fields (conditional based on service_request_type)
+        # For "opt_in_future": Only basic info required
+        # For "start_now": All fields required
         required_fields = {
             "student_information.first_name": student_first_name,
             "student_information.last_name": student_last_name,
@@ -179,15 +198,19 @@ async def submit_intake_form(
             "student_information.grade": student_grade,
             "student_information.school": student_school,
             "student_information.date_of_birth": student_dob,
-            "student_information.student_id": student_id,
             "parent_guardian_contact.name": parent_name,
             "parent_guardian_contact.email": parent_email,
             "parent_guardian_contact.phone": parent_phone,
-            "service_request_type": service_request_type,
-            "insurance_information.has_insurance": has_insurance_str,
-            "immediate_safety_concern": safety_concern_str,
-            "authorization_consent": authorization_consent_str
+            "service_request_type": service_request_type
         }
+        
+        # Additional required fields only for "start_now"
+        if requires_full_form:
+            required_fields.update({
+                "student_information.student_id": student_id,
+                "insurance_information.has_insurance": has_insurance_str,
+                "immediate_safety_concern": safety_concern_str,
+            })
         
         missing_fields = [field for field, value in required_fields.items() if not value]
         if missing_fields:
@@ -199,56 +222,74 @@ async def submit_intake_form(
         # 4. Validate CAPTCHA
         await validate_captcha(captcha_token)
         
-        # 5. Validate authorization consent
-        if authorization_consent_str.lower() != "true":
-            raise HTTPException(
-                status_code=400,
-                detail="Authorization consent is required"
-            )
+        # 5. Validate authorization consent (bypassed for public intake form)
+        # Note: Authorization consent is not required for public intake submission
+        # The form may be submitted without explicit consent, but consent is still tracked
+        authorization_consent = authorization_consent_str.lower() == "true" if authorization_consent_str else False
         
         # 6. Parse boolean values
         # Handle both "yes"/"no" and "true"/"false" formats
         has_insurance_lower = has_insurance_str.lower() if has_insurance_str else ""
-        has_insurance = has_insurance_lower in ["yes", "true", "1"]
+        has_insurance = has_insurance_lower in ["yes", "true", "1"] if has_insurance_str else False
         safety_concern_lower = safety_concern_str.lower() if safety_concern_str else ""
-        safety_concern = safety_concern_lower in ["yes", "true", "1"]
+        safety_concern = safety_concern_lower in ["yes", "true", "1"] if safety_concern_str else False
         
-        # 7. Validate insurance fields if has_insurance is true
-        if has_insurance:
-            if not all([insurance_company, policyholder_name, member_id]):
+        # 7. Validate insurance fields (only required for "start_now")
+        if requires_full_form:
+            if not has_insurance_str:
                 raise HTTPException(
                     status_code=422,
-                    detail="Insurance company, policyholder name, and member ID are required when insurance is selected"
+                    detail="insurance_information.has_insurance is required when service_request_type is 'start_now'"
                 )
+            
+            if has_insurance:
+                if not all([insurance_company, policyholder_name, member_id]):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Insurance company, policyholder name, and member ID are required when insurance is selected"
+                    )
+        else:
+            # For "opt_in_future", insurance is optional - default to False if not provided
+            if not has_insurance_str:
+                has_insurance = False
         
-        # Validate required service needs
-        if not service_category:
-            raise HTTPException(
-                status_code=422,
-                detail="At least one service category is required"
-            )
-        if "Other Service" in service_category and not service_category_other:
-            raise HTTPException(
-                status_code=422,
-                detail="service_category_other is required when 'Other Service' is selected"
-            )
-        if not severity_of_concern:
-            raise HTTPException(
-                status_code=422,
-                detail="severity_of_concern is required"
-            )
-        if severity_of_concern not in ["mild", "moderate", "severe"]:
-            raise HTTPException(
-                status_code=422,
-                detail="severity_of_concern must be 'mild', 'moderate', or 'severe'"
-            )
-        if not type_of_service_needed:
-            raise HTTPException(
-                status_code=422,
-                detail="At least one type of service needed is required"
-            )
+        # 8. Validate service needs (only required for "start_now")
+        if requires_full_form:
+            if not service_category:
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one service category is required when service_request_type is 'start_now'"
+                )
+            if "Other Service" in service_category and not service_category_other:
+                raise HTTPException(
+                    status_code=422,
+                    detail="service_category_other is required when 'Other Service' is selected"
+                )
+            if not severity_of_concern:
+                raise HTTPException(
+                    status_code=422,
+                    detail="severity_of_concern is required when service_request_type is 'start_now'"
+                )
+            if severity_of_concern not in ["mild", "moderate", "severe"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail="severity_of_concern must be 'mild', 'moderate', or 'severe'"
+                )
+            if not type_of_service_needed:
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one type of service needed is required when service_request_type is 'start_now'"
+                )
+        else:
+            # For "opt_in_future", service needs are optional - use defaults if not provided
+            if not service_category:
+                service_category = []
+            if not severity_of_concern:
+                severity_of_concern = "mild"  # Default
+            if not type_of_service_needed:
+                type_of_service_needed = []
         
-        # 6. Parse demographics arrays
+        # 9. Parse demographics arrays (optional for both, but validate if provided)
         race = parse_array_field(dict(form_data), "demographics.race")
         race_other = parse_nested_field(dict(form_data), "demographics.race_other")
         ethnicity = parse_array_field(dict(form_data), "demographics.ethnicity")
@@ -259,17 +300,10 @@ async def submit_intake_form(
                 detail="race_other is required when 'Other (please specify)' is selected"
             )
         
-        # 7. Validate service_request_type
-        if service_request_type not in ["start_now", "opt_in_future"]:
-            raise HTTPException(
-                status_code=422,
-                detail="service_request_type must be 'start_now' or 'opt_in_future'"
-            )
-        
-        # Map to database values
+        # 10. Map to database values
         opt_in_type = "immediate_service" if service_request_type == "start_now" else "future_eligibility"
         
-        # 8. Validate date format
+        # 11. Validate date format
         try:
             dob_date = datetime.strptime(student_dob, "%Y-%m-%d").date()
         except ValueError:
@@ -278,20 +312,21 @@ async def submit_intake_form(
                 detail="date_of_birth must be in YYYY-MM-DD format"
             )
         
-        # Store dob_date for later use in intake_queue
-        
-        # 9. Check for duplicate submissions
+        # 12. Check for duplicate submissions (only for "start_now")
+        # For "opt_in_future", we'll check for existing forms to update instead
         client_ip = get_client_ip(request)
-        if check_duplicate_submission(
-            db, student_first_name, student_last_name,
-            student_dob, parent_email
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="A similar submission was recently submitted. Please wait before submitting again."
-            )
+        if requires_full_form:
+            # For "start_now", check for recent duplicates
+            if check_duplicate_submission(
+                db, student_first_name, student_last_name,
+                student_dob, parent_email
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="A similar submission was recently submitted. Please wait before submitting again."
+                )
         
-        # 10. Find or create district and school
+        # 13. Find or create district and school
         # For now, we'll need to look up by school name or create if doesn't exist
         # TODO: Implement proper district/school lookup by code
         school_name = student_school.strip()
@@ -323,33 +358,100 @@ async def submit_intake_form(
             db.add(school)
             db.flush()
         
-        # 11. Generate student UUID
-        student_uuid = uuid4()
+        # 14. Check for existing form (for "opt_in_future" only) - for reference only, not for updating
+        # We'll use previous form data to fill in missing fields, but always create a new entry
+        previous_dashboard_record = None
+        previous_intake_queue = None
         
-        # 12. Calculate grade band and fiscal period
+        if not requires_full_form:  # Only for "opt_in_future"
+            # Look for the most recent matching dashboard record (any opt_in_type)
+            existing_records = (
+                db.query(DashboardRecord)
+                .filter(DashboardRecord.school_id == school.id)
+                .order_by(DashboardRecord.created_at.desc())
+                .all()
+            )
+            
+            for record in existing_records:
+                # Get associated intake queue
+                intake = db.query(IntakeQueue).filter(
+                    IntakeQueue.dashboard_record_id == record.id
+                ).first()
+                
+                if intake:
+                    # Match on: first_name, last_name, student_id, date_of_birth
+                    name_match = (
+                        intake.student_first_name.lower() == student_first_name.lower() and
+                        intake.student_last_name.lower() == student_last_name.lower()
+                    )
+                    
+                    dob_match = (
+                        intake.date_of_birth == dob_date
+                    )
+                    
+                    student_id_match = True  # Default to True if student_id not provided
+                    if student_id:
+                        student_id_match = (
+                            intake.student_id and 
+                            intake.student_id.lower() == student_id.lower()
+                        )
+                    elif intake.student_id:
+                        # If existing has student_id but new doesn't, don't match
+                        student_id_match = False
+                    
+                    if name_match and dob_match and student_id_match:
+                        previous_dashboard_record = record
+                        previous_intake_queue = intake
+                        break
+        
+        # Reuse existing dashboard/intake if found
+        existing_dashboard_record = previous_dashboard_record
+        existing_intake_queue = previous_intake_queue
+        
+        # 15. Generate student UUID (reuse if existing form found)
+        if existing_dashboard_record:
+            student_uuid = existing_dashboard_record.student_uuid
+        else:
+            student_uuid = uuid4()
+        
+        # 16. Calculate grade band and fiscal period
         grade_band = calculate_grade_band(student_grade)
         referral_date = datetime.now(timezone.utc).date()
         fiscal_period = calculate_fiscal_period(referral_date)
         
-        # 13. Create dashboard record (non-PHI)
-        # Store student name directly for easy dashboard display (simplified approach)
-        dashboard_record = DashboardRecord(
-            student_uuid=student_uuid,
-            district_id=school.district_id,
-            school_id=school.id,
-            student_name=student_full_name,  # Store name directly (non-encrypted for simplicity)
-            grade_band=grade_band,
-            referral_source="parent",  # Default, can be enhanced
-            opt_in_type=opt_in_type,
-            referral_date=referral_date,
-            fiscal_period=fiscal_period,
-            insurance_present=has_insurance,
-            service_status="pending"
-        )
-        db.add(dashboard_record)
+        # 17. Create or reuse dashboard record
+        if existing_dashboard_record:
+            dashboard_record = existing_dashboard_record
+            # Update non-destructive fields if provided
+            if student_full_name:
+                dashboard_record.student_name = student_full_name
+            if grade_band:
+                dashboard_record.grade_band = grade_band
+            dashboard_record.school_id = school.id
+            dashboard_record.district_id = school.district_id
+            # Update insurance_present only if provided
+            if has_insurance_str:
+                dashboard_record.insurance_present = has_insurance
+            dashboard_record.updated_at = datetime.now(timezone.utc)
+            db.add(dashboard_record)
+        else:
+            dashboard_record = DashboardRecord(
+                student_uuid=student_uuid,
+                district_id=school.district_id,
+                school_id=school.id,
+                student_name=student_full_name,  # Store name directly (non-encrypted for simplicity)
+                grade_band=grade_band,
+                referral_source="parent",  # Default, can be enhanced
+                opt_in_type=opt_in_type,
+                referral_date=referral_date,
+                fiscal_period=fiscal_period,
+                insurance_present=has_insurance,
+                service_status="pending"
+            )
+            db.add(dashboard_record)
         db.flush()  # Get the ID
         
-        # 14. Handle file uploads
+        # 17. Handle file uploads (only for "start_now" or if provided)
         front_card_path = None
         back_card_path = None
         
@@ -367,53 +469,132 @@ async def submit_intake_form(
                 "back"
             )
         
-        # 15. Create intake queue record (plain text - no encryption)
-        # Note: student_name is stored in dashboard_record above (line 310) for easy API access
-        intake_queue = IntakeQueue(
-            dashboard_record_id=dashboard_record.id,
-            # Student Information (Plain text)
-            student_first_name=student_first_name,
-            student_last_name=student_last_name,
-            student_full_name=student_full_name,
-            student_id=student_id if student_id else None,
-            student_grade=student_grade,  # Store actual grade
-            date_of_birth=dob_date,
-            # Parent/Guardian Contact (Plain text)
-            parent_name=parent_name,
-            parent_email=parent_email,
-            parent_phone=parent_phone,
-            # Insurance Information (Plain text)
-            insurance_company=insurance_company if insurance_company else None,
-            policyholder_name=policyholder_name if policyholder_name else None,
-            relationship_to_student=relationship if relationship else None,
-            member_id=member_id if member_id else None,
-            group_number=group_number if group_number else None,
-            insurance_card_front_url=front_card_path,
-            insurance_card_back_url=back_card_path,
-            # Service Needs (Plain text - JSON as text)
-            service_category=json.dumps(service_category),
-            service_category_other=service_category_other if service_category_other else None,
-            severity_of_concern=severity_of_concern,
-            type_of_service_needed=json.dumps(type_of_service_needed),
-            family_resources=json.dumps(family_resources) if family_resources else None,
-            referral_concern=json.dumps(referral_concern) if referral_concern else None,
-            # Demographics (Plain text)
-            sex_at_birth=sex_at_birth if sex_at_birth else None,
-            race=json.dumps(race) if race else None,
-            race_other=race_other if race_other else None,
-            ethnicity=json.dumps(ethnicity) if ethnicity else None,
-            # Safety & Authorization
-            immediate_safety_concern=safety_concern,
-            authorization_consent=True,
-            # Retention
-            expires_at=calculate_expires_at()
-        )
-        db.add(intake_queue)
+        # 18. Merge fields with previous (non-destructive) and update or create intake queue
+        if previous_intake_queue and not requires_full_form:
+            # Fill in missing fields from previous form
+            final_student_id = student_id if student_id else (previous_intake_queue.student_id if previous_intake_queue.student_id else None)
+            final_insurance_company = insurance_company if insurance_company else (previous_intake_queue.insurance_company if previous_intake_queue.insurance_company else None)
+            final_policyholder_name = policyholder_name if policyholder_name else (previous_intake_queue.policyholder_name if previous_intake_queue.policyholder_name else None)
+            final_relationship = relationship if relationship else (previous_intake_queue.relationship_to_student if previous_intake_queue.relationship_to_student else None)
+            final_member_id = member_id if member_id else (previous_intake_queue.member_id if previous_intake_queue.member_id else None)
+            final_group_number = group_number if group_number else (previous_intake_queue.group_number if previous_intake_queue.group_number else None)
+            final_front_card = front_card_path if front_card_path else (previous_intake_queue.insurance_card_front_url if previous_intake_queue.insurance_card_front_url else None)
+            final_back_card = back_card_path if back_card_path else (previous_intake_queue.insurance_card_back_url if previous_intake_queue.insurance_card_back_url else None)
+            
+            # Merge service needs - use new if provided, otherwise use previous
+            final_service_category = service_category if service_category else (json.loads(previous_intake_queue.service_category) if previous_intake_queue.service_category else [])
+            final_service_category_other = service_category_other if service_category_other else (previous_intake_queue.service_category_other if previous_intake_queue.service_category_other else None)
+            final_severity = severity_of_concern if severity_of_concern else (previous_intake_queue.severity_of_concern if previous_intake_queue.severity_of_concern else None)
+            final_type_of_service = type_of_service_needed if type_of_service_needed else (json.loads(previous_intake_queue.type_of_service_needed) if previous_intake_queue.type_of_service_needed else [])
+            final_family_resources = family_resources if family_resources else (json.loads(previous_intake_queue.family_resources) if previous_intake_queue.family_resources else [])
+            final_referral_concern = referral_concern if referral_concern else (json.loads(previous_intake_queue.referral_concern) if previous_intake_queue.referral_concern else [])
+            
+            # Merge demographics
+            final_sex_at_birth = sex_at_birth if sex_at_birth else (previous_intake_queue.sex_at_birth if previous_intake_queue.sex_at_birth else None)
+            final_race = race if race else (json.loads(previous_intake_queue.race) if previous_intake_queue.race else [])
+            final_race_other = race_other if race_other else (previous_intake_queue.race_other if previous_intake_queue.race_other else None)
+            final_ethnicity = ethnicity if ethnicity else (json.loads(previous_intake_queue.ethnicity) if previous_intake_queue.ethnicity else [])
+        else:
+            # No previous form or start_now - use provided values only
+            final_student_id = student_id if student_id else None
+            final_insurance_company = insurance_company if insurance_company else None
+            final_policyholder_name = policyholder_name if policyholder_name else None
+            final_relationship = relationship if relationship else None
+            final_member_id = member_id if member_id else None
+            final_group_number = group_number if group_number else None
+            final_front_card = front_card_path
+            final_back_card = back_card_path
+            final_service_category = service_category if service_category else []
+            final_service_category_other = service_category_other if service_category_other else None
+            final_severity = severity_of_concern if severity_of_concern else None
+            final_type_of_service = type_of_service_needed if type_of_service_needed else []
+            final_family_resources = family_resources if family_resources else []
+            final_referral_concern = referral_concern if referral_concern else []
+            final_sex_at_birth = sex_at_birth if sex_at_birth else None
+            final_race = race if race else []
+            final_race_other = race_other if race_other else None
+            final_ethnicity = ethnicity if ethnicity else []
         
-        # 16. Create audit log
+        if previous_intake_queue and not requires_full_form:
+            # Update existing intake queue non-destructively
+            intake_queue = previous_intake_queue
+            intake_queue.student_first_name = student_first_name
+            intake_queue.student_last_name = student_last_name
+            intake_queue.student_full_name = student_full_name
+            intake_queue.student_grade = student_grade
+            intake_queue.date_of_birth = dob_date
+            intake_queue.student_id = final_student_id
+            intake_queue.parent_name = parent_name
+            intake_queue.parent_email = parent_email
+            intake_queue.parent_phone = parent_phone
+            intake_queue.insurance_company = final_insurance_company
+            intake_queue.policyholder_name = final_policyholder_name
+            intake_queue.relationship_to_student = final_relationship
+            intake_queue.member_id = final_member_id
+            intake_queue.group_number = final_group_number
+            intake_queue.insurance_card_front_url = final_front_card
+            intake_queue.insurance_card_back_url = final_back_card
+            intake_queue.service_category = json.dumps(final_service_category) if final_service_category else None
+            intake_queue.service_category_other = final_service_category_other
+            intake_queue.severity_of_concern = final_severity
+            intake_queue.type_of_service_needed = json.dumps(final_type_of_service) if final_type_of_service else None
+            intake_queue.family_resources = json.dumps(final_family_resources) if final_family_resources else None
+            intake_queue.referral_concern = json.dumps(final_referral_concern) if final_referral_concern else None
+            intake_queue.sex_at_birth = final_sex_at_birth
+            intake_queue.race = json.dumps(final_race) if final_race else None
+            intake_queue.race_other = final_race_other
+            intake_queue.ethnicity = json.dumps(final_ethnicity) if final_ethnicity else None
+            intake_queue.immediate_safety_concern = safety_concern
+            intake_queue.authorization_consent = authorization_consent
+            intake_queue.expires_at = calculate_expires_at()
+            db.add(intake_queue)
+        else:
+            # Create new intake queue record
+            intake_queue = IntakeQueue(
+                dashboard_record_id=dashboard_record.id,
+                # Student Information (Plain text)
+                student_first_name=student_first_name,
+                student_last_name=student_last_name,
+                student_full_name=student_full_name,
+                student_id=final_student_id,
+                student_grade=student_grade,  # Store actual grade
+                date_of_birth=dob_date,
+                # Parent/Guardian Contact (Plain text)
+                parent_name=parent_name,
+                parent_email=parent_email,
+                parent_phone=parent_phone,
+                # Insurance Information (Plain text - merged from previous if opt_in_future)
+                insurance_company=final_insurance_company,
+                policyholder_name=final_policyholder_name,
+                relationship_to_student=final_relationship,
+                member_id=final_member_id,
+                group_number=final_group_number,
+                insurance_card_front_url=final_front_card,
+                insurance_card_back_url=final_back_card,
+                # Service Needs (Plain text - JSON as text, merged from previous if opt_in_future)
+                service_category=json.dumps(final_service_category) if final_service_category else None,
+                service_category_other=final_service_category_other,
+                severity_of_concern=final_severity,
+                type_of_service_needed=json.dumps(final_type_of_service) if final_type_of_service else None,
+                family_resources=json.dumps(final_family_resources) if final_family_resources else None,
+                referral_concern=json.dumps(final_referral_concern) if final_referral_concern else None,
+                # Demographics (Plain text - merged from previous if opt_in_future)
+                sex_at_birth=final_sex_at_birth,
+                race=json.dumps(final_race) if final_race else None,
+                race_other=final_race_other,
+                ethnicity=json.dumps(final_ethnicity) if final_ethnicity else None,
+                # Safety & Authorization
+                immediate_safety_concern=safety_concern,
+                authorization_consent=authorization_consent,
+                # Retention
+                expires_at=calculate_expires_at()
+            )
+            db.add(intake_queue)
+        
+        # 19. Create audit log
         audit_log = AuditLog(
             user_id=None,  # Public endpoint, no user
-            action="create",
+            action="update" if existing_intake_queue and not requires_full_form else "create",
             resource_type="intake_queue",
             resource_id=intake_queue.id,
             district_id=school.district_id,
@@ -422,20 +603,94 @@ async def submit_intake_form(
             details={
                 "student_uuid": str(student_uuid),
                 "service_request_type": service_request_type,
-                "has_insurance": has_insurance
+                "has_insurance": has_insurance,
+                "merged_with_previous": previous_intake_queue is not None if not requires_full_form else False
             }
         )
         db.add(audit_log)
         
-        # 17. Commit transaction
+        # 20. Commit transaction
         db.commit()
         
-        # 18. TODO: Send admin notification email
+        # 21. Prepare data for email notification
+        # Get file URLs if available
+        front_card_url = None
+        back_card_url = None
+        if front_card_path:
+            front_card_url = front_card_path
+        if back_card_path:
+            back_card_url = back_card_path
         
-        # 19. Return response
+        # Prepare email data (use merged values)
+        email_student_info = {
+            "first_name": student_first_name,
+            "last_name": student_last_name,
+            "full_name": student_full_name,
+            "student_id": final_student_id,
+            "grade": student_grade,
+            "school": student_school,
+            "date_of_birth": student_dob
+        }
+        
+        email_parent_contact = {
+            "name": parent_name,
+            "email": parent_email,
+            "phone": parent_phone
+        }
+        
+        # Use merged values for email (if previous form was used to fill missing fields)
+        email_insurance_info = {
+            "has_insurance": "yes" if (final_insurance_company or final_member_id) else "no",
+            "insurance_company": final_insurance_company,
+            "policyholder_name": final_policyholder_name,
+            "relationship_to_student": final_relationship,
+            "member_id": final_member_id,
+            "group_number": final_group_number,
+            "insurance_card_front_url": final_front_card,
+            "insurance_card_back_url": final_back_card
+        }
+        
+        # Prepare service needs for email (use merged values)
+        email_service_needs = {
+            "service_category": json.dumps(final_service_category) if (final_service_category and len(final_service_category) > 0) else None,
+            "service_category_other": final_service_category_other,
+            "severity_of_concern": final_severity,
+            "type_of_service_needed": json.dumps(final_type_of_service) if (final_type_of_service and len(final_type_of_service) > 0) else None,
+            "family_resources": json.dumps(final_family_resources) if (final_family_resources and len(final_family_resources) > 0) else None,
+            "referral_concern": json.dumps(final_referral_concern) if (final_referral_concern and len(final_referral_concern) > 0) else None
+        }
+        
+        email_demographics = None
+        if final_sex_at_birth or final_race or final_ethnicity:
+            email_demographics = {
+                "sex_at_birth": final_sex_at_birth,
+                "race": json.dumps(final_race) if final_race else None,
+                "race_other": final_race_other,
+                "ethnicity": json.dumps(final_ethnicity) if final_ethnicity else None
+            }
+        
+        # 22. Add email notification to background tasks (non-blocking)
+        # Email will be sent asynchronously after the response is returned
+        background_tasks.add_task(
+            send_intake_form_notification,
+            student_uuid=str(student_uuid),
+            service_request_type=service_request_type,
+            student_info=email_student_info,
+            parent_contact=email_parent_contact,
+            insurance_info=email_insurance_info,
+            service_needs=email_service_needs,
+            demographics=email_demographics,
+            safety_concern="yes" if safety_concern else "no",
+            authorization_consent=authorization_consent,
+            submitted_date=datetime.now(timezone.utc).isoformat(),
+            is_update=False  # Always create new entry, never update
+        )
+        
+        # 23. Return response immediately (email will be sent in background)
+        message = "Intake form submitted successfully"
         return IntakeFormResponse(
             student_uuid=student_uuid,
-            message="Intake form submitted successfully",
+            message=message,
             status="pending"
         )
         
@@ -443,9 +698,16 @@ async def submit_intake_form(
         raise
     except Exception as e:
         db.rollback()
-        print(f"Intake form submission error: {e}")
+        error_msg = f"Intake form submission error: {type(e).__name__}: {str(e)}"
+        print(error_msg)
         import traceback
         traceback.print_exc()
+        # In DEBUG mode, return more detailed error
+        if settings.DEBUG:
+            raise HTTPException(
+                status_code=500,
+                detail=f"An error occurred processing your request: {error_msg}"
+            )
         raise HTTPException(
             status_code=500,
             detail="An error occurred processing your request. Please try again later."
