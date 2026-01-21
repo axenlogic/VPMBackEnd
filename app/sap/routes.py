@@ -20,7 +20,7 @@ from app.db.database import get_db
 from app.sap.models import (
     District, School, DashboardRecord, IntakeQueue, AuditLog
 )
-from app.sap.schemas import IntakeFormResponse, IntakeStatusResponse, IntakeFormDetailsResponse
+from app.sap.schemas import IntakeFormResponse, IntakeStatusResponse, IntakeFormDetailsResponse, UpdateStatusRequest, UpdateStatusResponse
 from app.sap.utils import (
     calculate_grade_band, 
     calculate_fiscal_period, calculate_expires_at
@@ -1217,6 +1217,122 @@ async def update_intake_form(
         raise HTTPException(
             status_code=500,
             detail="An internal server error occurred. Please try again later."
+        )
+
+
+@router.put("/api/v1/intake/status/{identifier}", response_model=UpdateStatusResponse)
+async def update_intake_status(
+    identifier: str,
+    request_body: UpdateStatusRequest,
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Update intake form status
+    
+    Requires JWT authentication.
+    Only updates the status field of the intake form.
+    """
+    try:
+        # 1. Authenticate user
+        user = get_user_from_token(authorization, db)
+        
+        # 2. Find dashboard record by student_uuid
+        try:
+            student_uuid = UUID(identifier)
+        except ValueError:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form not found."
+            )
+        
+        dashboard_record = db.query(DashboardRecord).filter(
+            DashboardRecord.student_uuid == student_uuid
+        ).first()
+        
+        if not dashboard_record:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake form not found."
+            )
+        
+        # 3. Check access control (for now, all authenticated users can update)
+        # TODO: Implement role-based access when User model has role/district_id fields
+        # if user.role != "vpm_admin" and user.district_id != dashboard_record.district_id:
+        #     raise HTTPException(
+        #         status_code=403,
+        #         detail="You do not have permission to update this intake form status."
+        #     )
+        
+        # 4. Validate status value (already validated by Pydantic, but double-check)
+        new_status = request_body.status
+        allowed_statuses = ["pending", "processed", "active"]
+        if new_status not in allowed_statuses:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid status value. Must be one of: pending, processed, active"
+            )
+        
+        # 5. Get old status for audit log
+        old_status = dashboard_record.service_status
+        
+        # 6. Update status if changed
+        if dashboard_record.service_status != new_status:
+            dashboard_record.service_status = new_status
+            dashboard_record.updated_at = datetime.now(timezone.utc)
+            
+            # If status is "processed", also update intake_queue
+            if new_status == "processed":
+                intake_queue = db.query(IntakeQueue).filter(
+                    IntakeQueue.dashboard_record_id == dashboard_record.id
+                ).first()
+                if intake_queue and not intake_queue.processed:
+                    intake_queue.processed = True
+                    intake_queue.processed_at = datetime.now(timezone.utc)
+                    intake_queue.processed_by = user.id
+            
+            db.commit()
+            db.refresh(dashboard_record)
+        
+        # 7. Log audit trail
+        client_ip = get_client_ip(request)
+        audit_log = AuditLog(
+            user_id=user.id,
+            action="update_status",
+            resource_type="intake_form",
+            resource_id=dashboard_record.id,
+            district_id=dashboard_record.district_id,
+            ip_address=client_ip,
+            user_agent=request.headers.get("user-agent"),
+            details={
+                "student_uuid": str(student_uuid),
+                "old_status": old_status,
+                "new_status": new_status
+            }
+        )
+        db.add(audit_log)
+        db.commit()
+        
+        # 8. Return response
+        updated_at = dashboard_record.updated_at.isoformat() if dashboard_record.updated_at else None
+        
+        return UpdateStatusResponse(
+            id=str(student_uuid),
+            student_uuid=str(student_uuid),
+            status=new_status,
+            updated_at=updated_at
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating intake form status: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while updating the intake form status."
         )
 
 

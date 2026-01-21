@@ -60,6 +60,26 @@ class IntakeStatusResponse(BaseModel):
     processed_date: Optional[str]  # ISO 8601 datetime
 
 
+class UpdateStatusRequest(BaseModel):
+    """Request to update intake form status"""
+    status: str = Field(..., description="Status: pending, processed, or active")
+    
+    @validator('status')
+    def validate_status(cls, v):
+        allowed_statuses = ["pending", "processed", "active"]
+        if v not in allowed_statuses:
+            raise ValueError(f"Status must be one of: {', '.join(allowed_statuses)}")
+        return v
+
+
+class UpdateStatusResponse(BaseModel):
+    """Response after updating intake form status"""
+    id: str  # Student UUID
+    student_uuid: str  # Student UUID
+    status: str
+    updated_at: Optional[str]  # ISO 8601 datetime
+
+
 # Dashboard Schemas
 class DashboardSummaryResponse(BaseModel):
     """Dashboard summary statistics"""
