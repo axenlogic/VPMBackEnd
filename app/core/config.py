@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     
     # Development
     DEBUG: bool = True
+
+    # Dashboard access control
+    VPM_ADMIN_EMAILS: str = "dev-support@vpmforschools.org"
     
     class Config:
         env_file = ".env"

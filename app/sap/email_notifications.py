@@ -394,8 +394,9 @@ def send_intake_form_notification(
     is_update: bool = False
 ):
     """Send email notification to VPM admin when intake form is submitted"""
-    
-    admin_email = "dev-support@vpmforschools.org"
+    admin_emails = [email.strip() for email in settings.VPM_ADMIN_EMAILS.split(",") if email.strip()]
+    if not admin_emails:
+        admin_emails = ["dev-support@vpmforschools.org"]
     
     # Determine subject
     action_label = "Updated" if is_update else "Submitted"
@@ -418,11 +419,12 @@ def send_intake_form_notification(
     )
     
     # Send email (gracefully handle failures)
-    try:
-        send_email(admin_email, subject, email_body)
-        print(f"✓ Intake form notification email sent to {admin_email}")
-    except Exception as e:
-        # Log the error but don't fail the request
-        print(f"⚠ Failed to send intake form notification email: {e}")
-        # In production, you might want to log this to a monitoring system
+    for admin_email in admin_emails:
+        try:
+            send_email(admin_email, subject, email_body)
+            print(f"✓ Intake form notification email sent to {admin_email}")
+        except Exception as e:
+            # Log the error but don't fail the request
+            print(f"⚠ Failed to send intake form notification email to {admin_email}: {e}")
+            # In production, you might want to log this to a monitoring system
 
