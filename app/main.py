@@ -64,6 +64,10 @@ app.include_router(sap_routes.router, tags=["Intake"])
 from app.sap import dashboard_routes as sap_dashboard_routes
 app.include_router(sap_dashboard_routes.router, tags=["Dashboard"])
 
+# Include external integration routes
+from app.integration import routes as integration_routes
+app.include_router(integration_routes.router, tags=["Integration"])
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}

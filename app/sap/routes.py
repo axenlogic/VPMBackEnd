@@ -5,7 +5,7 @@ PUBLIC ENDPOINTS - No authentication required
 Implements security measures: rate limiting, CAPTCHA, input validation
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Header, BackgroundTasks, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Request, Header, BackgroundTasks, BackgroundTasks, Query
 from fastapi import UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -31,6 +31,8 @@ from app.sap.email_notifications import send_intake_form_notification
 from app.core.config import settings
 from app.auth.routes import get_user_from_token
 from app.auth.models import User
+from app.integration.auth import verify_intake_token
+from app.integration.schemas import VerifyStudentResponse, StudentInfo, ParentInfo, SchoolInfo
 
 router = APIRouter()
 
@@ -50,6 +52,14 @@ def ensure_user_can_access_record(user: User, dashboard_record: DashboardRecord)
             status_code=403,
             detail="You do not have permission to access this intake form."
         )
+
+def authenticate_intake_request(authorization: str, db: Session):
+    """Allow either user JWT or intake-only integration token."""
+    try:
+        return "user", get_user_from_token(authorization, db)
+    except HTTPException:
+        payload = verify_intake_token(authorization)
+        return "external", payload
 
 
 async def parse_multipart_form(request: Request) -> dict:
@@ -112,10 +122,105 @@ def parse_nested_field(form_data: dict, field_path: str) -> Optional[str]:
     return str(value).strip() if value else None
 
 
+@router.get("/api/v1/intake/prefill", response_model=VerifyStudentResponse)
+async def intake_prefill(
+    authorization: str = Header(...),
+    student_id: str = Query(..., description="Student ID"),
+    first_name: str = Query(..., description="Student first name"),
+    last_name: str = Query(..., description="Student last name"),
+    date_of_birth: str = Query(..., description="Date of birth YYYY-MM-DD"),
+    school_id: Optional[str] = Query(None, description="School ID"),
+    school_name: Optional[str] = Query(None, description="School name"),
+    district_id: Optional[str] = Query(None, description="District ID"),
+    district_name: Optional[str] = Query(None, description="District name"),
+    father_name: Optional[str] = Query(None, description="Parent name"),
+    email_address: Optional[str] = Query(None, description="Parent email"),
+    phone: Optional[str] = Query(None, description="Parent phone"),
+    grade: Optional[str] = Query(None, description="Student grade"),
+    db: Session = Depends(get_db),
+):
+    """
+    External prefill endpoint for intake form (intake-only token required).
+    """
+    verify_intake_token(authorization)
+
+    if not (school_id or school_name) or not (district_id or district_name):
+        raise HTTPException(status_code=422, detail="School and district are required for prefill")
+
+    district = None
+    school = None
+    if district_id:
+        district = db.query(District).filter(District.id == int(district_id)).first()
+    elif district_name:
+        district = db.query(District).filter(District.name.ilike(district_name)).first()
+
+    if school_id:
+        school = db.query(School).filter(School.id == int(school_id)).first()
+    elif school_name and district:
+        school = (
+            db.query(School)
+            .filter(School.district_id == district.id, School.name.ilike(school_name))
+            .first()
+        )
+
+    if not district or not school:
+        raise HTTPException(status_code=404, detail="No matching record")
+
+    matches = (
+        db.query(DashboardRecord, IntakeQueue)
+        .join(IntakeQueue, IntakeQueue.dashboard_record_id == DashboardRecord.id)
+        .filter(DashboardRecord.school_id == school.id)
+        .filter(IntakeQueue.student_id.ilike(student_id.strip()))
+        .all()
+    )
+
+    match_level = "none"
+    if matches:
+        for _, intake in matches:
+            name_match = (
+                intake.student_first_name.lower() == first_name.strip().lower()
+                and intake.student_last_name.lower() == last_name.strip().lower()
+            )
+            dob_match = intake.date_of_birth and intake.date_of_birth.isoformat() == date_of_birth.strip()
+            if name_match and dob_match:
+                match_level = "exact"
+                break
+            if name_match:
+                match_level = "partial"
+
+    if match_level == "none":
+        raise HTTPException(status_code=404, detail="No matching record")
+
+    return VerifyStudentResponse(
+        verified=True,
+        match_level=match_level,
+        student=StudentInfo(
+            firstName=first_name,
+            lastName=last_name,
+            grade=grade,
+            school=school_name or school.name,
+            dateOfBirth=date_of_birth,
+            studentId=student_id,
+        ),
+        parent=ParentInfo(
+            fatherName=father_name,
+            emailAddress=email_address or "",
+            phone=phone or "",
+        ),
+        school=SchoolInfo(
+            schoolName=school.name,
+            districtName=district.name,
+            schoolId=str(school.id),
+            districtId=str(district.id),
+        ),
+    )
+
+
 @router.post("/api/v1/intake/submit", response_model=IntakeFormResponse)
 async def submit_intake_form(
     request: Request,
     background_tasks: BackgroundTasks,
+    authorization: str = Header(...),
     db: Session = Depends(get_db)
 ):
     """
@@ -126,6 +231,7 @@ async def submit_intake_form(
     Rate limited: 5 submissions per hour per IP
     """
     try:
+        authenticate_intake_request(authorization, db)
         # 1. Parse multipart form data
         parsed = await parse_multipart_form(request)
         form_data = parsed["form"]
@@ -771,13 +877,15 @@ async def submit_intake_form(
 async def check_intake_status(
     request: Request,
     student_uuid: UUID,
+    authorization: str = Header(...),
     db: Session = Depends(get_db)
 ):
     """
-    PUBLIC ENDPOINT - Check intake form status using UUID
-    No authentication required
+    Check intake form status using UUID
+    Requires JWT or intake-only integration token
     Returns minimal non-PHI status information
     """
+    authenticate_intake_request(authorization, db)
     try:
         # Find dashboard record by UUID
         dashboard_record = db.query(DashboardRecord).filter(

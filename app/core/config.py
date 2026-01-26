@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     # Dashboard access control (fallback only if user.role not set)
     VPM_ADMIN_EMAILS: str = "dev-support@vpmforschools.org"
     
+    # External integration (client credentials)
+    INTEGRATION_CLIENT_ID: str = "portal-district"
+    INTEGRATION_CLIENT_SECRET: str = "pDWe_VB3NSym3lkBeTCBBDXb"
+    INTEGRATION_TOKEN_EXPIRY_MINUTES: int = 60
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

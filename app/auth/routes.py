@@ -384,6 +384,11 @@ def get_user_from_token(authorization: str, db: Session):
     token = authorization.split(" ")[1]
     payload = decode_jwt_token(token)
     user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
     
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
