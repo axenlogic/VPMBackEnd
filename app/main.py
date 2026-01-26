@@ -96,6 +96,26 @@ def on_startup() -> None:
         except Exception as col_exc:
             # Column might already exist or there's a permission issue - that's okay
             print(f"Note: student_name column check: {col_exc}")
+
+        # Add role/district/school columns to users table if missing (migration)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    ALTER TABLE users 
+                    ADD COLUMN IF NOT EXISTS role VARCHAR(100);
+                """))
+                conn.execute(text("""
+                    ALTER TABLE users 
+                    ADD COLUMN IF NOT EXISTS district_id INTEGER;
+                """))
+                conn.execute(text("""
+                    ALTER TABLE users 
+                    ADD COLUMN IF NOT EXISTS school_id INTEGER;
+                """))
+                conn.commit()
+                print("✅ users.role/district_id/school_id columns added/verified successfully")
+        except Exception as col_exc:
+            print(f"Note: users columns check: {col_exc}")
     except Exception as exc:
         # Log and continue so health checks still pass
         print(f"Startup DB init skipped: {exc}")

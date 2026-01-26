@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Header
 from sqlalchemy.orm import Session
+import re
 from app.db.database import get_db
 from app.auth.models import User, OTPVerification, PasswordResetToken
 from app.auth.schemas import (
@@ -13,8 +14,60 @@ from app.auth.utils import (
     create_jwt_token, decode_jwt_token, send_otp_email, send_password_reset_email
 )
 from app.core.config import settings
+from app.sap.models import District, School
 
 router = APIRouter()
+
+def _slugify(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    return value.strip("-")
+
+def _apply_user_access_context(user: User, db: Session) -> User:
+    """Attach role and district_id to the user object based on global settings."""
+    if getattr(user, "role", None):
+        if user.role == "admin":
+            user.district_id = None
+            user.school_id = None
+        return user
+
+    admin_emails = [email.strip().lower() for email in (settings.VPM_ADMIN_EMAILS or "").split(",") if email.strip()]
+    if user.email.lower() in admin_emails:
+        user.role = "admin"
+        user.district_id = None
+        user.school_id = None
+        return user
+
+    user.role = "user"
+    user.district_id = None
+    user.school_id = None
+    return user
+
+def _build_user_role_payload(user: User, db: Session) -> dict:
+    role_value = getattr(user, "role", None) or "user"
+    if role_value == "admin":
+        role_type = "admin"
+    elif role_value.startswith("school-"):
+        role_type = "school-user"
+    elif role_value.startswith("district-"):
+        role_type = "district-user"
+    else:
+        role_type = "user"
+
+    district_name = None
+    school_name = None
+    if getattr(user, "district_id", None):
+        district = db.query(District).filter(District.id == user.district_id).first()
+        district_name = district.name if district else None
+    if getattr(user, "school_id", None):
+        school = db.query(School).filter(School.id == user.school_id).first()
+        school_name = school.name if school else None
+
+    return {
+        "role": role_type,
+        "districtName": district_name,
+        "schoolName": school_name
+    }
 
 @router.post("/signup", response_model=SignupResponse)
 def signup(request: SignupRequest, db: Session = Depends(get_db)):
@@ -141,8 +194,16 @@ def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
     
     # Generate JWT token
     token = create_jwt_token(user.id, user.email)
+    user = _apply_user_access_context(user, db)
     
-    return {"access_token": token, "token_type": "bearer", "username": user.email, "full_name": user.full_name}
+    role_payload = _build_user_role_payload(user, db)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "username": user.email,
+        "full_name": user.full_name,
+        **role_payload
+    }
 
 @router.post("/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
@@ -164,8 +225,16 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         
         # Generate JWT token
         token = create_jwt_token(user.id, user.email)
+        user = _apply_user_access_context(user, db)
         
-        return {"access_token": token, "token_type": "bearer", "username": user.email, "full_name": user.full_name}
+        role_payload = _build_user_role_payload(user, db)
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "username": user.email,
+            "full_name": user.full_name,
+            **role_payload
+        }
     except Exception as e:
         # Log the error for debugging
         print(f"Login error: {str(e)}")
@@ -323,7 +392,7 @@ def get_user_from_token(authorization: str, db: Session):
             detail="User not found"
         )
     
-    return user
+    return _apply_user_access_context(user, db)
 
 @router.get("/user/profile", response_model=UserProfile)
 def get_profile(authorization: str = Header(...), db: Session = Depends(get_db)):

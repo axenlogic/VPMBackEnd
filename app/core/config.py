@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # Development
     DEBUG: bool = True
 
-    # Dashboard access control
+    # Dashboard access control (fallback only if user.role not set)
     VPM_ADMIN_EMAILS: str = "dev-support@vpmforschools.org"
     
     class Config:

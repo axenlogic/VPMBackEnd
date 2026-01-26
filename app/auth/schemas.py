@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, validator
+from typing import Optional
 
 class SignupRequest(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=100)
@@ -43,6 +44,9 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     username: str  # email address
     full_name: str
+    role: str = "user"
+    districtName: Optional[str] = None
+    schoolName: Optional[str] = None
 
 class ErrorResponse(BaseModel):
     message: str
@@ -61,6 +65,9 @@ class UserProfile(BaseModel):
     full_name: str
     email: str
     is_verified: bool
+    role: str = "user"
+    district_id: Optional[int] = None
+    school_id: Optional[int] = None
     
     class Config:
         from_attributes = True

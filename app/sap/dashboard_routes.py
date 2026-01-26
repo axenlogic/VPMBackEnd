@@ -40,6 +40,8 @@ def get_admin_emails() -> List[str]:
 
 
 def is_vpm_admin(user: User) -> bool:
+    if getattr(user, "role", None) == "admin":
+        return True
     return user.email.lower() in get_admin_emails()
 
 
@@ -159,12 +161,15 @@ def build_period_labels(start: date, end: date, period: str) -> Tuple[List[str],
 def apply_scope_filters(query, user: User, district_id: Optional[int], school_id: Optional[int]) -> Tuple:
     admin = is_vpm_admin(user)
     user_district_id = getattr(user, "district_id", None)
+    user_school_id = getattr(user, "school_id", None)
     if not admin:
         if district_id and user_district_id and district_id != user_district_id:
             raise HTTPException(status_code=403, detail="You do not have access to this district")
         if not user_district_id:
             raise HTTPException(status_code=403, detail="District access not configured for this user")
         query = query.filter(DashboardRecord.district_id == user_district_id)
+        if user_school_id:
+            query = query.filter(DashboardRecord.school_id == user_school_id)
     else:
         if district_id:
             query = query.filter(DashboardRecord.district_id == district_id)
@@ -179,13 +184,10 @@ def check_district_access(user: User, district_id: int, db: Session) -> bool:
     VPM Admin: has access to all districts
     District Admin/Viewer: only their assigned district
     """
-    # TODO: Add role and district_id fields to User model
-    # For now, assume all users are VPM Admin (can access all)
-    # When roles are implemented:
-    # if user.role == "vpm_admin":
-    #     return True
-    # return user.district_id == district_id
-    return True
+    if is_vpm_admin(user):
+        return True
+    user_district_id = getattr(user, "district_id", None)
+    return bool(user_district_id and user_district_id == district_id)
 
 
 @router.get("/api/v1/dashboard/districts-schools")

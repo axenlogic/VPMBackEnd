@@ -34,6 +34,23 @@ from app.auth.models import User
 
 router = APIRouter()
 
+def ensure_user_can_access_record(user: User, dashboard_record: DashboardRecord):
+    """Enforce district scoping for non-admin users."""
+    if getattr(user, "role", None) == "admin":
+        return
+    user_district_id = getattr(user, "district_id", None)
+    if not user_district_id or user_district_id != dashboard_record.district_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to access this intake form."
+        )
+    user_school_id = getattr(user, "school_id", None)
+    if user_school_id and user_school_id != dashboard_record.school_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to access this intake form."
+        )
+
 
 async def parse_multipart_form(request: Request) -> dict:
     """
@@ -312,19 +329,8 @@ async def submit_intake_form(
                 detail="date_of_birth must be in YYYY-MM-DD format"
             )
         
-        # 12. Check for duplicate submissions (only for "start_now")
-        # For "opt_in_future", we'll check for existing forms to update instead
+        # 12. Check for duplicate submissions (only for "start_now" and no student_id match)
         client_ip = get_client_ip(request)
-        if requires_full_form:
-            # For "start_now", check for recent duplicates
-            if check_duplicate_submission(
-                db, student_first_name, student_last_name,
-                student_dob, parent_email
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="A similar submission was recently submitted. Please wait before submitting again."
-                )
         
         # 13. Find or create district and school
         # For now, we'll need to look up by school name or create if doesn't exist
@@ -358,12 +364,29 @@ async def submit_intake_form(
             db.add(school)
             db.flush()
         
-        # 14. Check for existing form (for "opt_in_future" only) - for reference only, not for updating
-        # We'll use previous form data to fill in missing fields, but always create a new entry
+        # 14. Check for existing form (merge into previous if found)
+        # Primary key for matching is student_id if provided
         previous_dashboard_record = None
         previous_intake_queue = None
-        
-        if not requires_full_form:  # Only for "opt_in_future"
+
+        if student_id:
+            previous_dashboard_record = (
+                db.query(DashboardRecord)
+                .join(IntakeQueue, IntakeQueue.dashboard_record_id == DashboardRecord.id)
+                .filter(
+                    DashboardRecord.school_id == school.id,
+                    IntakeQueue.student_id.ilike(student_id)
+                )
+                .order_by(DashboardRecord.created_at.desc())
+                .first()
+            )
+            if previous_dashboard_record:
+                previous_intake_queue = db.query(IntakeQueue).filter(
+                    IntakeQueue.dashboard_record_id == previous_dashboard_record.id
+                ).first()
+
+        # If no student_id match, use opt_in_future matching rules
+        if not previous_dashboard_record and not requires_full_form:
             # Look for the most recent matching dashboard record (any opt_in_type)
             existing_records = (
                 db.query(DashboardRecord)
@@ -403,6 +426,17 @@ async def submit_intake_form(
                         previous_dashboard_record = record
                         previous_intake_queue = intake
                         break
+
+        # If start_now and no student_id match, apply recent duplicate check
+        if requires_full_form and not previous_dashboard_record:
+            if check_duplicate_submission(
+                db, student_first_name, student_last_name,
+                student_dob, parent_email
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="A similar submission was recently submitted. Please wait before submitting again."
+                )
         
         # Reuse existing dashboard/intake if found
         existing_dashboard_record = previous_dashboard_record
@@ -429,6 +463,9 @@ async def submit_intake_form(
                 dashboard_record.grade_band = grade_band
             dashboard_record.school_id = school.id
             dashboard_record.district_id = school.district_id
+            # If new submission is start_now, upgrade opt_in_type if needed
+            if opt_in_type == "immediate_service":
+                dashboard_record.opt_in_type = "immediate_service"
             # Update insurance_present only if provided
             if has_insurance_str:
                 dashboard_record.insurance_present = has_insurance
@@ -470,30 +507,46 @@ async def submit_intake_form(
             )
         
         # 18. Merge fields with previous (non-destructive) and update or create intake queue
-        if previous_intake_queue and not requires_full_form:
-            # Fill in missing fields from previous form
-            final_student_id = student_id if student_id else (previous_intake_queue.student_id if previous_intake_queue.student_id else None)
-            final_insurance_company = insurance_company if insurance_company else (previous_intake_queue.insurance_company if previous_intake_queue.insurance_company else None)
-            final_policyholder_name = policyholder_name if policyholder_name else (previous_intake_queue.policyholder_name if previous_intake_queue.policyholder_name else None)
-            final_relationship = relationship if relationship else (previous_intake_queue.relationship_to_student if previous_intake_queue.relationship_to_student else None)
-            final_member_id = member_id if member_id else (previous_intake_queue.member_id if previous_intake_queue.member_id else None)
-            final_group_number = group_number if group_number else (previous_intake_queue.group_number if previous_intake_queue.group_number else None)
-            final_front_card = front_card_path if front_card_path else (previous_intake_queue.insurance_card_front_url if previous_intake_queue.insurance_card_front_url else None)
-            final_back_card = back_card_path if back_card_path else (previous_intake_queue.insurance_card_back_url if previous_intake_queue.insurance_card_back_url else None)
-            
-            # Merge service needs - use new if provided, otherwise use previous
-            final_service_category = service_category if service_category else (json.loads(previous_intake_queue.service_category) if previous_intake_queue.service_category else [])
-            final_service_category_other = service_category_other if service_category_other else (previous_intake_queue.service_category_other if previous_intake_queue.service_category_other else None)
-            final_severity = severity_of_concern if severity_of_concern else (previous_intake_queue.severity_of_concern if previous_intake_queue.severity_of_concern else None)
-            final_type_of_service = type_of_service_needed if type_of_service_needed else (json.loads(previous_intake_queue.type_of_service_needed) if previous_intake_queue.type_of_service_needed else [])
-            final_family_resources = family_resources if family_resources else (json.loads(previous_intake_queue.family_resources) if previous_intake_queue.family_resources else [])
-            final_referral_concern = referral_concern if referral_concern else (json.loads(previous_intake_queue.referral_concern) if previous_intake_queue.referral_concern else [])
-            
+        if existing_intake_queue:
+            def prefer_existing(existing_value, new_value):
+                if existing_value is None:
+                    return new_value
+                if isinstance(existing_value, str) and existing_value.strip() == "":
+                    return new_value
+                if isinstance(existing_value, list) and len(existing_value) == 0:
+                    return new_value
+                return existing_value
+
+            # Fill in missing fields from previous form (do not overwrite existing values)
+            final_student_id = prefer_existing(existing_intake_queue.student_id, student_id)
+            final_insurance_company = prefer_existing(existing_intake_queue.insurance_company, insurance_company)
+            final_policyholder_name = prefer_existing(existing_intake_queue.policyholder_name, policyholder_name)
+            final_relationship = prefer_existing(existing_intake_queue.relationship_to_student, relationship)
+            final_member_id = prefer_existing(existing_intake_queue.member_id, member_id)
+            final_group_number = prefer_existing(existing_intake_queue.group_number, group_number)
+            final_front_card = prefer_existing(existing_intake_queue.insurance_card_front_url, front_card_path)
+            final_back_card = prefer_existing(existing_intake_queue.insurance_card_back_url, back_card_path)
+
+            # Merge service needs
+            existing_service_category = json.loads(existing_intake_queue.service_category) if existing_intake_queue.service_category else []
+            existing_type_of_service = json.loads(existing_intake_queue.type_of_service_needed) if existing_intake_queue.type_of_service_needed else []
+            existing_family_resources = json.loads(existing_intake_queue.family_resources) if existing_intake_queue.family_resources else []
+            existing_referral_concern = json.loads(existing_intake_queue.referral_concern) if existing_intake_queue.referral_concern else []
+
+            final_service_category = prefer_existing(existing_service_category, service_category or [])
+            final_service_category_other = prefer_existing(existing_intake_queue.service_category_other, service_category_other)
+            final_severity = prefer_existing(existing_intake_queue.severity_of_concern, severity_of_concern)
+            final_type_of_service = prefer_existing(existing_type_of_service, type_of_service_needed or [])
+            final_family_resources = prefer_existing(existing_family_resources, family_resources or [])
+            final_referral_concern = prefer_existing(existing_referral_concern, referral_concern or [])
+
             # Merge demographics
-            final_sex_at_birth = sex_at_birth if sex_at_birth else (previous_intake_queue.sex_at_birth if previous_intake_queue.sex_at_birth else None)
-            final_race = race if race else (json.loads(previous_intake_queue.race) if previous_intake_queue.race else [])
-            final_race_other = race_other if race_other else (previous_intake_queue.race_other if previous_intake_queue.race_other else None)
-            final_ethnicity = ethnicity if ethnicity else (json.loads(previous_intake_queue.ethnicity) if previous_intake_queue.ethnicity else [])
+            existing_race = json.loads(existing_intake_queue.race) if existing_intake_queue.race else []
+            existing_ethnicity = json.loads(existing_intake_queue.ethnicity) if existing_intake_queue.ethnicity else []
+            final_sex_at_birth = prefer_existing(existing_intake_queue.sex_at_birth, sex_at_birth)
+            final_race = prefer_existing(existing_race, race or [])
+            final_race_other = prefer_existing(existing_intake_queue.race_other, race_other)
+            final_ethnicity = prefer_existing(existing_ethnicity, ethnicity or [])
         else:
             # No previous form or start_now - use provided values only
             final_student_id = student_id if student_id else None
@@ -855,13 +908,8 @@ async def get_intake_form_details(
                 detail="Intake form not found. Please verify the identifier and try again."
             )
         
-        # 3. Check access control (for now, all authenticated users can access)
-        # TODO: Implement role-based access when User model has role/district_id fields
-        # if user.role != "vpm_admin" and user.district_id != dashboard_record.district_id:
-        #     raise HTTPException(
-        #         status_code=403,
-        #         detail="You do not have permission to access this intake form."
-        #     )
+        # 3. Check access control (district-scoped for non-admin users)
+        ensure_user_can_access_record(user, dashboard_record)
         
         # 4. Get intake queue record
         intake_queue = db.query(IntakeQueue).filter(
@@ -1073,8 +1121,8 @@ async def update_intake_form(
                 detail="Intake form not found. Please verify the identifier and try again."
             )
         
-        # 3. Check access control (for now, all authenticated users can update)
-        # TODO: Implement role-based access when User model has role/district_id fields
+        # 3. Check access control (district-scoped for non-admin users)
+        ensure_user_can_access_record(user, dashboard_record)
         
         # 4. Get intake queue record
         intake_queue = db.query(IntakeQueue).filter(
@@ -1519,13 +1567,8 @@ async def update_intake_status(
                 detail="Intake form not found."
             )
         
-        # 3. Check access control (for now, all authenticated users can update)
-        # TODO: Implement role-based access when User model has role/district_id fields
-        # if user.role != "vpm_admin" and user.district_id != dashboard_record.district_id:
-        #     raise HTTPException(
-        #         status_code=403,
-        #         detail="You do not have permission to update this intake form status."
-        #     )
+        # 3. Check access control (district-scoped for non-admin users)
+        ensure_user_can_access_record(user, dashboard_record)
         
         # 4. Validate status value (already validated by Pydantic, but double-check)
         new_status = request_body.status
@@ -1648,9 +1691,8 @@ async def serve_insurance_card(
         if not dashboard_record:
             raise HTTPException(status_code=404, detail="File not found")
         
-        # TODO: Add role-based access check when User model has role/district_id
-        # if user.role != "vpm_admin" and user.district_id != dashboard_record.district_id:
-        #     raise HTTPException(status_code=403, detail="Access denied")
+        # 3. Check access control (district-scoped for non-admin users)
+        ensure_user_can_access_record(user, dashboard_record)
         
         # 4. Find the file path from intake queue
         intake_queue = db.query(IntakeQueue).filter(
