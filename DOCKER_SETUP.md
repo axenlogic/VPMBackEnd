@@ -89,8 +89,10 @@ JWT_SECRET_KEY=your-secret-key-here
 SMTP_EMAIL=your-email@gmail.com
 SMTP_PASSWORD=your-app-password
 
-# Encryption (generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-ENCRYPTION_KEY=your-encryption-key-here
+# Integration (external client token)
+INTEGRATION_CLIENT_ID=portal-district
+INTEGRATION_CLIENT_SECRET=change-me
+INTEGRATION_TOKEN_EXPIRY_MINUTES=60
 
 # Debug
 DEBUG=True
@@ -156,6 +158,11 @@ gcloud run deploy vpm-backend \
   --add-cloudsql-instances=PROJECT:REGION:INSTANCE \
   --set-env-vars ENVIRONMENT=cloud_run
 ```
+
+### Production Notes
+- Set `DEBUG=False` in Cloud Run.
+- Use a strong `JWT_SECRET_KEY` and `INTEGRATION_CLIENT_SECRET`.
+- `UPLOAD_DIR` defaults to local disk; Cloud Run has ephemeral storage. Use Cloud Storage in production for insurance card files.
 
 ---
 
